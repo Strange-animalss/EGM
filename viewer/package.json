@@ -1,0 +1,17 @@
+{
+  "name": "erpgenworldmodel-viewer",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Spark.js viewer for the ERP-NVS-FastGS pipeline output.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port 8765"
+  },
+  "dependencies": {
+    "@sparkjsdev/spark": "^2.0.0",
+    "three": "^0.180.0"
+  },
+  "devDependencies": {
+    "vite": "^5.4.0"
+  }
+}

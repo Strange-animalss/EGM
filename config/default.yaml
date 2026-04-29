@@ -1,0 +1,106 @@
+# Default configuration for the ERP -> NVS -> FastGS -> Spark.js pipeline.
+# All values are overridable on the command line via OmegaConf dotlist
+# (e.g. `python scripts/generate_erp.py cuboid.size_xyz=[6,6,3]`).
+
+cuboid:
+  # Cuboid space (meters). x = width, y = depth, z = height.
+  size_xyz: [4.0, 4.0, 3.0]
+  # World coordinate of the cuboid center (where the initial pose lives by default).
+  center_world: [0.0, 0.0, 1.5]
+  # Fraction by which corner poses are pulled toward the center.
+  # 0.0 = exactly at the corner. 0.5 = halfway between corner and center.
+  corner_inset: 0.20
+  # Where corner poses look at: "center" | "outward" | "random".
+  corner_lookat: "center"
+
+poses:
+  initial:
+    # Local offset relative to cuboid.center_world.
+    xyz_local: [0.0, 0.0, 0.0]
+    # Euler angles (xyz, intrinsic, degrees). Identity = looking +X (yaw=0).
+    euler_xyz_deg: [0.0, 0.0, 0.0]
+  # "auto_8_corners" | list of poses (each {xyz_local: [..], euler_xyz_deg: [..]}).
+  generation: "auto_8_corners"
+
+openai:
+  model: "gpt-image-2"
+  # ERP requires 2:1. 3840x1920 satisfies <=3840 long edge and <=3:1 ratio.
+  size: "3840x1920"
+  rgb_quality: "high"
+  edit_quality: "high"
+  api_key_env: "OPENAI_API_KEY"
+  request_timeout_sec: 180
+  max_retries: 4
+  retry_backoff_sec: 5.0
+  cache_dir: "outputs/.openai_cache"
+  # Text model for scene prompt expansion (GPT-5.5-pro deep reasoning).
+  text_model: "gpt-5.5-pro"
+  text_model_api_key_env: "OPENAI_API_KEY"
+  reasoning_effort: "high"
+  # Deep reasoning for gpt-image-2 generate/edit calls (null = disabled).
+  image_reasoning_effort: "medium"
+
+prompt:
+  scene_default: "coffee shop"
+  randomize: true
+  # null = a fresh random seed per run; integer = reproducible.
+  seed: null
+  style_pool: ["scandinavian", "industrial loft", "vintage parisian", "japandi", "tropical"]
+  light_pool:
+    - "soft morning sun streaming through tall windows"
+    - "rainy afternoon, gloomy diffuse light, condensation on glass"
+    - "neon-lit dusk, magenta and teal accents"
+    - "warm tungsten night, candlelight reflections"
+  occupancy_pool: ["empty", "a couple of patrons reading", "busy peak hours, baristas working"]
+  extra_props_pool:
+    - "wooden floor, exposed brick, espresso machine, chalkboard menu, hanging plants"
+    - "marble counter, leather banquettes, brass pendant lights, art prints on walls"
+    - "concrete floor, pine tables, minimalist white shelves, ceramic mugs lined up"
+    - "rattan chairs, jute rugs, large monstera plants, woven wall art"
+
+nvs:
+  # "hybrid" (center independent + corners warp+inpaint) | "independent" | "warp_inpaint_only".
+  strategy: "hybrid"
+  hole_dilate_px: 6
+  # When true, run DAP on the center RGB and use it to linearly recalibrate the
+  # gpt-image-2 depth ERPs. Requires DAP weights & a working torch+CUDA env.
+  use_dap_fallback: false
+  dap_weights_dir: ""
+  # Depth decode range (meters). gpt-image-2 grayscale depth is mapped linearly
+  # near=white(255) -> near_m, far=black(0) -> far_m.
+  depth_near_m: 0.3
+  depth_far_m: 12.0
+
+perspective:
+  # "cubemap" (6 views per pose) | "dodeca" (18 views per pose).
+  scheme: "cubemap"
+  fov_deg: 90.0
+  out_size: 1024
+
+fastgs:
+  # Path to the cloned FastGS repo (auto-detect if empty).
+  repo_path: "third_party/FastGS"
+  iterations: 7000
+  # When true, write the back-projected sparse cloud as points3D.txt and let
+  # FastGS use it instead of running COLMAP SfM.
+  init_from_points3d: true
+  # Max points in the initial cloud (we voxel-downsample to this).
+  init_max_points: 200000
+  init_voxel_m: 0.04
+  # Extra command-line args to forward to FastGS train.py.
+  extra_args: []
+
+viewer:
+  port: 8765
+  bind: "127.0.0.1"
+  # If empty, serve_viewer.py picks the latest run under outputs/runs/.
+  default_run_id: ""
+
+run:
+  # Where everything per-run goes.
+  outputs_dir: "outputs/runs"
+  # Auto-incremented if empty.
+  run_id: ""
+
+mock:
+  enabled: false
