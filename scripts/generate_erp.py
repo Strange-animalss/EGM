@@ -28,12 +28,12 @@ from erpgen.config import (
     save_resolved_config,
 )
 from erpgen.decode import decode_depth_png, decode_normal_png, try_dap_calibrate  # noqa: E402
-from erpgen.erp_to_persp import rotate_normals_to_world, split_all_to_cubemap  # noqa: E402
+from erpgen.erp_to_persp import rotate_normals_to_world, split_all_to_perspectives  # noqa: E402
 from erpgen.init_pcd import build_init_pcd, save_pcd_ply  # noqa: E402
 from erpgen.nvs import run_hybrid_nvs  # noqa: E402
 from erpgen.openai_erp import ImageClient, OpenAIConfig  # noqa: E402
 from erpgen.poses import build_pose_set, save_poses_json  # noqa: E402
-from erpgen.prompts import sample_scene, scene_from_user_input  # noqa: E402
+from erpgen.prompts import sample_scene, scene_description, scene_from_user_input  # noqa: E402
 from erpgen.scene_expander import SceneExpander  # noqa: E402
 
 
@@ -78,11 +78,16 @@ def generate(
             expander = SceneExpander(
                 model=str(cfg.openai.text_model),
                 api_key_env=str(cfg.openai.text_model_api_key_env),
+                api_key=str(cfg.openai.get("api_key", "")),
+                base_url=str(cfg.openai.get("base_url", "")),
+                provider=str(cfg.openai.get("provider", "openai")),
+                http_referer=str(cfg.openai.get("http_referer", "https://github.com/erpgen")),
+                app_title=str(cfg.openai.get("app_title", "ERPGen")),
                 reasoning_effort=str(cfg.openai.reasoning_effort),
                 verbose=verbose,
                 mock=bool(cfg.mock.enabled),
             )
-            scene_spec = expander.expand(scene)
+            scene_spec = expander.expand(scene, seed=cfg.prompt.seed)
             if verbose:
                 print(f"[generate_erp] expanded scene: {scene_spec.to_dict()}", flush=True)
     else:
@@ -107,52 +112,107 @@ def generate(
         depth_near_m=float(cfg.nvs.depth_near_m),
         depth_far_m=float(cfg.nvs.depth_far_m),
         strategy=str(cfg.nvs.strategy),
+        verbose=verbose,
+        dap_model_size=str(cfg.nvs.get("dap_model_size", "base")),
+        dap_mode=str(cfg.nvs.get("dap_mode", "direct")),
     )
 
-    # ---- 4. decode + (optional) DAP recalibrate ----
+    # ---- 4. collect arrays (depth/normal already estimated by NVS via DAP) ----
     Wo, Ho = client.parse_size()
     rgb_arrs: list[np.ndarray] = []
     depth_arrs: list[np.ndarray] = []
     normal_world_arrs: list[np.ndarray] = []
     for i, tri in enumerate(triplets):
         rgb = np.array(tri.rgb.convert("RGB"))
-        dep = decode_depth_png(
-            tri.depth_img.convert("RGB"),
-            near_m=float(cfg.nvs.depth_near_m),
-            far_m=float(cfg.nvs.depth_far_m),
-        )
-        nrm_cam = decode_normal_png(
-            tri.normal_img.convert("RGB")
-        )
-        if cfg.nvs.use_dap_fallback and i == 0:
-            dep, info = try_dap_calibrate(
-                tri.rgb, dep, weights_dir=str(cfg.nvs.dap_weights_dir)
+        if tri.depth_m is None or tri.normal_world is None:
+            # Backwards-compat path: triplet came from an old code path that
+            # only had PNG depth/normal. Decode the PNGs into floats.
+            dep = decode_depth_png(
+                tri.depth_img.convert("RGB"),
+                near_m=float(cfg.nvs.depth_near_m),
+                far_m=float(cfg.nvs.depth_far_m),
             )
-            if verbose:
-                print(f"[generate_erp] DAP calibration: {info}", flush=True)
-        nrm_world = rotate_normals_to_world(nrm_cam, tri.pose.R)
+            nrm_cam = decode_normal_png(tri.normal_img.convert("RGB"))
+            nrm_world = rotate_normals_to_world(nrm_cam, tri.pose.R)
+        else:
+            dep = tri.depth_m
+            nrm_world = tri.normal_world
         rgb_arrs.append(rgb)
         depth_arrs.append(dep)
         normal_world_arrs.append(nrm_world)
 
-    # save metric depth as .npy for downstream / debugging
+    # NVS already saved .npy depth+normal alongside each triplet, but in case
+    # the old PNG-decoded path was hit above, ensure all .npy files exist.
     npy_dir = run_dir / "erp_decoded"
     npy_dir.mkdir(parents=True, exist_ok=True)
     for i, (d, n) in enumerate(zip(depth_arrs, normal_world_arrs)):
-        np.save(npy_dir / f"pose_{i}_depth_m.npy", d)
-        np.save(npy_dir / f"pose_{i}_normal_world.npy", n)
+        dpath = npy_dir / f"pose_{i}_depth_m.npy"
+        npath = npy_dir / f"pose_{i}_normal_world.npy"
+        if not dpath.exists():
+            np.save(dpath, d)
+        if not npath.exists():
+            np.save(npath, n)
 
-    # ---- 5. cubemap split ----
+    # ---- 5. perspective split (cubemap or persp16) ----
     persp_dir = run_dir / "perspective"
-    pose_face_sets, _cam_json = split_all_to_cubemap(
+    pose_face_sets, _cam_json = split_all_to_perspectives(
         poses=poses,
         rgb_erps=rgb_arrs,
         depth_erps_m=depth_arrs,
         normal_erps_world=normal_world_arrs,
         out_dir=persp_dir,
+        scheme=str(cfg.perspective.scheme),
         fov_deg=float(cfg.perspective.fov_deg),
         out_size=int(cfg.perspective.out_size),
     )
+
+    # ---- 5b. (optional) per-face image-2 enhancement ----
+    enhance = bool(cfg.perspective.get("enhance_with_image2", False))
+    only_center = bool(cfg.perspective.get("enhance_only_center_pose", False))
+    if enhance and not client.mock_mode:
+        scene_text = scene_description(scene_spec)
+        target_size = int(cfg.perspective.out_size)
+        n_faces = sum(len(s.faces) for s in pose_face_sets)
+        if only_center:
+            n_faces = len(pose_face_sets[0].faces) if pose_face_sets else 0
+        if verbose:
+            print(
+                f"[generate_erp] enhancing {n_faces} perspective faces with "
+                f"{cfg.openai.model} (this is the slow part)...",
+                flush=True,
+            )
+        for s in pose_face_sets:
+            if only_center and s.pose_idx != 0:
+                continue
+            for face in s.faces:
+                ref_img = Image.open(face.image_path).convert("RGB")
+                refined = client.enhance_perspective(
+                    ref_img, scene_text, out_size=target_size,
+                )
+                refined.save(face.image_path)
+                face.width = int(target_size)
+                face.height = int(target_size)
+                if verbose:
+                    print(
+                        f"  enhanced pose_{s.pose_idx}/{face.face_name}",
+                        flush=True,
+                    )
+        # Re-write cameras.json with possibly-updated dimensions.
+        import json as _json  # local import to avoid shadowing top-level
+        (persp_dir / "cameras.json").write_text(
+            _json.dumps(
+                {
+                    "fov_deg": float(cfg.perspective.fov_deg),
+                    "out_size": int(target_size),
+                    "scheme": str(cfg.perspective.scheme),
+                    "enhanced": True,
+                    "enhance_only_center_pose": only_center,
+                    "views": [face.__dict__ for s in pose_face_sets for face in s.faces],
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
 
     # ---- 6. init point cloud + COLMAP ----
     pcd = build_init_pcd(
