@@ -23,22 +23,37 @@ poses:
   generation: "auto_8_corners"
 
 openai:
-  model: "gpt-image-2"
-  # ERP requires 2:1. 3840x1920 satisfies <=3840 long edge and <=3:1 ratio.
-  size: "3840x1920"
+  # provider: "openai"  -> standard /v1/images/{generations,edits} (official OpenAI / OpenAI-compatible relays)
+  # provider: "openrouter" -> /v1/chat/completions with modalities=["image","text"]
+  provider: "openrouter"
+  # On OpenRouter the closest equivalent of "gpt-image-2" is openai/gpt-5.4-image-2.
+  model: "openai/gpt-5.4-image-2"
+  # ERP must be 2:1. We use 1024x512 because OpenRouter image models render at
+  # 1024x1024 native; bucketing to 1024x512 means at most a single axis crop
+  # rather than 4x upsampling. We then up-detail per-perspective view via i2i
+  # if perspective.enhance_with_image2 is enabled.
+  size: "1024x512"
+  upsample_to_target_size: true
   rgb_quality: "high"
   edit_quality: "high"
   api_key_env: "OPENAI_API_KEY"
-  request_timeout_sec: 180
+  # Direct API key (overrides api_key_env when set). Leave empty to use env var.
+  api_key: ""
+  # Base URL for OpenAI-compatible proxy/relay. Empty = official OpenAI endpoint.
+  base_url: "https://openrouter.ai/api/v1"
+  http_referer: "https://github.com/erpgen"
+  app_title: "ERPGen"
+  request_timeout_sec: 600
   max_retries: 4
   retry_backoff_sec: 5.0
   cache_dir: "outputs/.openai_cache"
   # Text model for scene prompt expansion (GPT-5.5-pro deep reasoning).
-  text_model: "gpt-5.5-pro"
+  # On OpenRouter use the prefixed ID openai/gpt-5.5-pro.
+  text_model: "openai/gpt-5.5-pro"
   text_model_api_key_env: "OPENAI_API_KEY"
   reasoning_effort: "high"
   # Deep reasoning for gpt-image-2 generate/edit calls (null = disabled).
-  image_reasoning_effort: "medium"
+  image_reasoning_effort: null
 
 prompt:
   scene_default: "coffee shop"
