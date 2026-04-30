@@ -44,6 +44,14 @@ class OpenAIConfig:
     rgb_quality: str = "high"
     edit_quality: str = "high"
     api_key_env: str = "OPENAI_API_KEY"
+    api_key: str = ""
+    base_url: str = ""
+    # "openai"  -> use /v1/images/generations and /v1/images/edits (official OpenAI / OpenAI-compatible relays)
+    # "openrouter" -> use /v1/chat/completions with modalities=["image","text"] (no mask support, fixed output size)
+    provider: str = "openai"
+    # OpenRouter has no /v1/images/* endpoint; output is locked to model defaults
+    # (typically 1024x1024). We upsample to `size` after generation.
+    upsample_to_target_size: bool = True
     request_timeout_sec: float = 180.0
     max_retries: int = 4
     retry_backoff_sec: float = 5.0
@@ -52,6 +60,9 @@ class OpenAIConfig:
     text_model_api_key_env: str = "OPENAI_API_KEY"
     reasoning_effort: str = "high"
     image_reasoning_effort: str | None = None
+    # Optional HTTP-Referer / X-Title for OpenRouter ranking (harmless on others).
+    http_referer: str = "https://github.com/erpgen"
+    app_title: str = "ERPGen"
 
     @classmethod
     def from_dict(cls, cfg) -> "OpenAIConfig":
@@ -64,6 +75,10 @@ class OpenAIConfig:
             rgb_quality=str(d.get("rgb_quality", "high")),
             edit_quality=str(d.get("edit_quality", "high")),
             api_key_env=str(d.get("api_key_env", "OPENAI_API_KEY")),
+            api_key=str(d.get("api_key", "")),
+            base_url=str(d.get("base_url", "")),
+            provider=str(d.get("provider", "openai")).lower(),
+            upsample_to_target_size=bool(d.get("upsample_to_target_size", True)),
             request_timeout_sec=float(d.get("request_timeout_sec", 180.0)),
             max_retries=int(d.get("max_retries", 4)),
             retry_backoff_sec=float(d.get("retry_backoff_sec", 5.0)),
@@ -72,6 +87,8 @@ class OpenAIConfig:
             text_model_api_key_env=str(d.get("text_model_api_key_env", "OPENAI_API_KEY")),
             reasoning_effort=str(d.get("reasoning_effort", "high")),
             image_reasoning_effort=str(image_re) if image_re is not None else None,
+            http_referer=str(d.get("http_referer", "https://github.com/erpgen")),
+            app_title=str(d.get("app_title", "ERPGen")),
         )
 
 
@@ -121,7 +138,7 @@ class ImageClient:
 
         self._client = None
         if not self._mock:
-            api_key = os.environ.get(cfg.api_key_env, "").strip()
+            api_key = cfg.api_key.strip() or os.environ.get(cfg.api_key_env, "").strip()
             if not api_key:
                 if allow_mock_fallback:
                     self._mock = True
@@ -138,7 +155,15 @@ class ImageClient:
                 try:
                     from openai import OpenAI  # noqa: WPS433
 
-                    self._client = OpenAI(api_key=api_key, timeout=cfg.request_timeout_sec)
+                    kwargs: dict = dict(api_key=api_key, timeout=cfg.request_timeout_sec)
+                    if cfg.base_url:
+                        kwargs["base_url"] = cfg.base_url
+                    if cfg.provider == "openrouter":
+                        kwargs["default_headers"] = {
+                            "HTTP-Referer": cfg.http_referer,
+                            "X-Title": cfg.app_title,
+                        }
+                    self._client = OpenAI(**kwargs)
                 except Exception as exc:  # pragma: no cover - import error path
                     if allow_mock_fallback:
                         self._mock = True
@@ -168,6 +193,18 @@ class ImageClient:
     def mock_mode(self) -> bool:
         return self._mock
 
+    @property
+    def supports_mask(self) -> bool:
+        """True if the underlying provider exposes a real binary-mask edit API.
+
+        OpenAI's `/v1/images/edits` does. OpenRouter's chat-based image API
+        does NOT (we fake it with a magenta paint, which is lossy and not
+        recommended for high-quality NVS).
+        """
+        if self._mock:
+            return True
+        return self.cfg.provider != "openrouter"
+
     def parse_size(self, size_str: str | None = None) -> tuple[int, int]:
         s = size_str or self.cfg.size
         w, h = s.lower().split("x")
@@ -178,7 +215,7 @@ class ImageClient:
     def generate_rgb(self, prompt: str, *, size: str | None = None) -> Image.Image:
         size = size or self.cfg.size
         key = _hash_request([
-            "generate", self.cfg.model, size, self.cfg.rgb_quality, prompt,
+            "generate", self.cfg.provider, self.cfg.model, size, self.cfg.rgb_quality, prompt,
             self.cfg.image_reasoning_effort or "",
         ])
         cached = self._load_cached(key)
@@ -210,7 +247,8 @@ class ImageClient:
         ref_bytes = _png_bytes(image)
         mask_bytes = _png_bytes(mask)
         key = _hash_request([
-            "edits", self.cfg.model, size, quality, prompt, ref_bytes, mask_bytes,
+            "edits", self.cfg.provider, self.cfg.model, size, quality, prompt,
+            ref_bytes, mask_bytes,
             self.cfg.image_reasoning_effort or "",
         ])
         cached = self._load_cached(key)
@@ -233,9 +271,163 @@ class ImageClient:
         self._save_cached(key, img)
         return img
 
+    # ----------------- generate with reference (no mask) -----------------
+
+    def generate_with_ref(
+        self,
+        prompt: str,
+        ref_image: Image.Image,
+        *,
+        size: str | None = None,
+    ) -> Image.Image:
+        """Image-to-image generation with a reference image but NO mask.
+
+        Used by the NVS scheduler when `supports_mask` is False (e.g. OpenRouter):
+        for corner poses we cannot do a true geometric warp+inpaint, but we CAN
+        condition on the center pose's RGB so the model keeps materials, lighting,
+        people/no-people, color palette, and overall room identity consistent.
+
+        On OpenRouter -> chat completions with an image_url content part.
+        On OpenAI    -> images.edits without a mask (= whole-image i2i).
+        Returns an image at `size` (auto-resized if the model produced a different one).
+        """
+        size = size or self.cfg.size
+        ref_rgb = ref_image.convert("RGB")
+        ref_bytes = _png_bytes(ref_rgb)
+        target_w, target_h = self.parse_size(size)
+        key = _hash_request([
+            "gen_with_ref", self.cfg.provider, self.cfg.model, size,
+            self.cfg.rgb_quality, prompt, ref_bytes,
+            self.cfg.image_reasoning_effort or "",
+        ])
+        cached = self._load_cached(key)
+        if cached is not None:
+            return cached
+
+        if self._mock:
+            # Use mock_edit with an all-zero mask (no painting), which is just a recolor of ref.
+            mask = Image.new("L", ref_rgb.size, 0)
+            img = _mock_edit_erp(self.parse_size(size), ref_rgb, mask, prompt)
+            self._save_cached(key, img)
+            return img
+
+        img = self._call_with_retry(
+            self._call_generate_with_ref,
+            prompt=prompt,
+            image_bytes=ref_bytes,
+            size=size,
+        )
+        if img.size != (target_w, target_h):
+            img = img.resize((target_w, target_h), Image.BICUBIC)
+        self._save_cached(key, img)
+        return img
+
+    def _call_generate_with_ref(self, *, prompt: str, image_bytes: bytes, size: str) -> Image.Image:
+        if self.cfg.provider == "openrouter":
+            return self._chat_image_call(
+                prompt=prompt, size=size, ref_image_bytes=image_bytes,
+            )
+        # OpenAI: images.edits with no mask = whole-image i2i.
+        img_io = io.BytesIO(image_bytes)
+        img_io.name = "image.png"
+        kwargs = dict(
+            model=self.cfg.model,
+            prompt=prompt,
+            image=img_io,
+            size=size,
+            quality=self.cfg.rgb_quality,
+            n=1,
+        )
+        if self.cfg.image_reasoning_effort:
+            kwargs["reasoning_effort"] = self.cfg.image_reasoning_effort
+        resp = self._client.images.edits(**kwargs)  # type: ignore[union-attr]
+        b64 = resp.data[0].b64_json
+        if not b64:
+            raise RuntimeError("OpenAI generate_with_ref returned empty b64_json")
+        return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+
+    # ----------------------- enhance perspective -------------------------
+
+    def enhance_perspective(
+        self,
+        ref_image: Image.Image,
+        scene_prompt: str,
+        *,
+        out_size: int = 1024,
+    ) -> Image.Image:
+        """Image-to-image refine of a perspective view.
+
+        Takes the perspective face cut from the ERP (which may be coarse because
+        the ERP source is only 1024x512) and runs it through gpt-image-2 with the
+        scene description so the model fills in native 1024-px detail while
+        preserving composition. Returns an RGB image of (out_size, out_size).
+        """
+        ref_rgb = ref_image.convert("RGB")
+        if ref_rgb.size != (out_size, out_size):
+            ref_rgb = ref_rgb.resize((out_size, out_size), Image.BICUBIC)
+        ref_bytes = _png_bytes(ref_rgb)
+        size = f"{out_size}x{out_size}"
+        prompt = (
+            "This is a perspective view (90 degree FOV) cut from a 360 panorama "
+            "of the following scene: " + scene_prompt.strip() + ". "
+            "Regenerate the same view as a sharp, photorealistic, "
+            "high-detail interior photograph at native resolution. "
+            "Preserve the existing composition, layout, large objects, color "
+            "palette, and lighting EXACTLY. Do NOT add text, watermarks, "
+            "captions, logos, or UI overlays."
+        )
+        key = _hash_request([
+            "enhance_persp", self.cfg.provider, self.cfg.model, size,
+            self.cfg.rgb_quality, prompt, ref_bytes,
+            self.cfg.image_reasoning_effort or "",
+        ])
+        cached = self._load_cached(key)
+        if cached is not None:
+            return cached
+
+        if self._mock:
+            self._save_cached(key, ref_rgb)
+            return ref_rgb
+
+        img = self._call_with_retry(
+            self._call_enhance,
+            prompt=prompt,
+            image_bytes=ref_bytes,
+            size=size,
+        )
+        if img.size != (out_size, out_size):
+            img = img.resize((out_size, out_size), Image.BICUBIC)
+        self._save_cached(key, img)
+        return img
+
+    def _call_enhance(self, *, prompt: str, image_bytes: bytes, size: str) -> Image.Image:
+        if self.cfg.provider == "openrouter":
+            return self._chat_image_call(prompt=prompt, size=size, ref_image_bytes=image_bytes)
+        # OpenAI-style i2i: use images.edits without a mask (whole-image refine).
+        img_io = io.BytesIO(image_bytes)
+        img_io.name = "image.png"
+        kwargs = dict(
+            model=self.cfg.model,
+            prompt=prompt,
+            image=img_io,
+            size=size,
+            quality=self.cfg.rgb_quality,
+            n=1,
+        )
+        if self.cfg.image_reasoning_effort:
+            kwargs["reasoning_effort"] = self.cfg.image_reasoning_effort
+        resp = self._client.images.edits(**kwargs)  # type: ignore[union-attr]
+        b64 = resp.data[0].b64_json
+        if not b64:
+            raise RuntimeError("OpenAI enhance returned empty b64_json")
+        return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+
     # ------------------------- inner: real API ---------------------------
 
     def _call_generate(self, *, prompt: str, size: str, quality: str) -> Image.Image:
+        if self.cfg.provider == "openrouter":
+            return self._chat_image_call(prompt=prompt, size=size, ref_image_bytes=None)
+
         kwargs: dict = dict(
             model=self.cfg.model,
             prompt=prompt,
@@ -260,6 +452,24 @@ class ImageClient:
         size: str,
         quality: str,
     ) -> Image.Image:
+        if self.cfg.provider == "openrouter":
+            # OpenRouter chat completions does not accept a binary mask. We render the
+            # masked region into the reference image (white = "regenerate this region",
+            # black = "keep") and instruct the model in text. This is a degraded fallback
+            # vs. real OpenAI image edits, but is the best we can do via OpenRouter.
+            composed = _compose_ref_with_mask(image_bytes, mask_bytes)
+            buf = io.BytesIO()
+            composed.save(buf, format="PNG")
+            ref_bytes = buf.getvalue()
+            edit_prompt = (
+                "Edit the supplied panorama image. The bright magenta regions mark areas "
+                "that must be regenerated to satisfy the request below. Keep all other "
+                "regions visually identical to the input. Request: " + prompt
+            )
+            return self._chat_image_call(
+                prompt=edit_prompt, size=size, ref_image_bytes=ref_bytes
+            )
+
         img_io = io.BytesIO(image_bytes)
         img_io.name = "image.png"
         mask_io = io.BytesIO(mask_bytes)
@@ -280,6 +490,62 @@ class ImageClient:
         if not b64:
             raise RuntimeError("OpenAI edit returned empty b64_json")
         return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+
+    # ----- OpenRouter chat-based image generation -----
+
+    def _chat_image_call(
+        self,
+        *,
+        prompt: str,
+        size: str,
+        ref_image_bytes: bytes | None,
+    ) -> Image.Image:
+        """Generate an image via /v1/chat/completions (OpenRouter style).
+
+        OpenRouter exposes image-output models only through the chat endpoint
+        with `modalities: ["image", "text"]`. The image is returned as a base64
+        data URL inside `choices[0].message.images[0].image_url.url`. Output
+        dimensions are model-fixed (e.g. 1024x1024); we upsample to `size`
+        afterwards if upsample_to_target_size is set.
+        """
+        target_w, target_h = self.parse_size(size)
+        size_hint = (
+            f"\n\nThe final image must be a 2:1 equirectangular panorama "
+            f"(target {target_w}x{target_h})."
+        )
+        content: list = [{"type": "text", "text": prompt + size_hint}]
+        if ref_image_bytes is not None:
+            ref_b64 = base64.b64encode(ref_image_bytes).decode("ascii")
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{ref_b64}"},
+            })
+
+        extra_body: dict = {"modalities": ["image", "text"]}
+        resp = self._client.chat.completions.create(  # type: ignore[union-attr]
+            model=self.cfg.model,
+            messages=[{"role": "user", "content": content}],
+            extra_body=extra_body,
+        )
+        msg = resp.choices[0].message
+        # The OpenAI SDK stores unknown fields under `model_extra`; OpenRouter's
+        # `images` field is one such extension.
+        images = getattr(msg, "images", None)
+        if images is None and hasattr(msg, "model_extra"):
+            images = (msg.model_extra or {}).get("images")
+        if not images:
+            raise RuntimeError(
+                f"OpenRouter chat returned no images. content={getattr(msg, 'content', None)!r}"
+            )
+        first = images[0]
+        url = first["image_url"]["url"] if isinstance(first, dict) else first.image_url.url
+        if not url.startswith("data:"):
+            raise RuntimeError(f"Unexpected image url (not data:): {url[:80]}")
+        b64 = url.split(",", 1)[1]
+        img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+        if self.cfg.upsample_to_target_size and img.size != (target_w, target_h):
+            img = img.resize((target_w, target_h), Image.BICUBIC)
+        return img
 
     def _call_with_retry(self, fn, **kwargs) -> Image.Image:
         last_exc: Exception | None = None
@@ -331,6 +597,29 @@ class ImageClient:
                 prompts["normal"], out["rgb"], ref_mask, size=size
             )
         return out
+
+
+# ---------------------------------------------------------------------------
+# OpenRouter "mask" fallback
+# ---------------------------------------------------------------------------
+
+
+def _compose_ref_with_mask(image_bytes: bytes, mask_bytes: bytes) -> Image.Image:
+    """Paint the masked region magenta on top of the reference image.
+
+    OpenRouter's chat-completion image API has no mask parameter, so the only
+    way to localize an edit is to mark the region visually inside the reference
+    image. We use a saturated magenta (255,0,255) plus a soft alpha so the
+    underlying content is still partially visible to the model.
+    """
+    base = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    mask = Image.open(io.BytesIO(mask_bytes)).convert("L").resize(base.size, Image.NEAREST)
+    base_arr = np.array(base, dtype=np.float32)
+    mask_arr = (np.array(mask, dtype=np.float32) / 255.0)[..., None]
+    magenta = np.array([255.0, 0.0, 255.0], dtype=np.float32)[None, None, :]
+    alpha = 0.65
+    blended = base_arr * (1.0 - mask_arr * alpha) + magenta * (mask_arr * alpha)
+    return Image.fromarray(np.clip(blended, 0, 255).astype(np.uint8), "RGB")
 
 
 # ---------------------------------------------------------------------------

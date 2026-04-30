@@ -21,6 +21,8 @@ from omegaconf import DictConfig, ListConfig, OmegaConf
 ERP_HARD_CONSTRAINT = (
     "equirectangular 360 panorama, 2:1 aspect ratio, full sphere, "
     "seamless horizontal wraparound (left and right edges identical), "
+    "EMPTY ROOM, NO PEOPLE, NO HUMANS, NO ANIMALS, NO FIGURES, "
+    "NO PORTRAITS OR PHOTOS OF PEOPLE ON THE WALLS, "
     "no text, no captions, no watermark, no logos, no UI overlay"
 )
 
@@ -105,17 +107,27 @@ def scene_from_user_input(scene_description: str) -> SceneSpec:
 
 
 def scene_description(scene: SceneSpec) -> str:
-    """Compose the shared scene description string (no ERP / kind suffix)."""
+    """Compose the shared scene description string (no ERP / kind suffix).
+
+    The field shape works for both pool-sampled SceneSpecs (short adjectives)
+    and SceneExpander-produced SceneSpecs (long, sentence-style fields).
+    """
     if not scene.style and not scene.light and not scene.occupancy and not scene.extra_props:
         return (
-            f"{scene.scene_kind}, "
-            f"realistic interior photography, sharp focus, well-composed"
+            f"{scene.scene_kind}. "
+            f"Realistic interior photography, sharp focus, well-composed."
         )
-    return (
-        f"a {scene.style} {scene.scene_kind}, {scene.light}, "
-        f"{scene.occupancy}, {scene.extra_props}, "
-        f"realistic interior photography, sharp focus, well-composed"
-    )
+    parts = [f"Scene: {scene.scene_kind}."]
+    if scene.style:
+        parts.append(f"Style and architecture: {scene.style}.")
+    if scene.light:
+        parts.append(f"Lighting: {scene.light}.")
+    if scene.occupancy:
+        parts.append(f"Occupancy: {scene.occupancy}.")
+    if scene.extra_props:
+        parts.append(f"Visible details: {scene.extra_props}.")
+    parts.append("Realistic interior photography, sharp focus, well-composed.")
+    return " ".join(parts)
 
 
 def _viewpoint_hint(pose_idx: int, total_poses: int) -> str:
