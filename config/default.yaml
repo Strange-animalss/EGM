@@ -60,16 +60,23 @@ prompt:
 
 nvs:
   # "hybrid" (center independent + corners warp+inpaint) | "independent" | "warp_inpaint_only".
+  # When the active provider does not support mask edits (e.g. OpenRouter), corner
+  # poses always use a ref-image-conditioned i2i path regardless of this value so
+  # the room identity stays consistent across views.
   strategy: "hybrid"
   hole_dilate_px: 6
-  # When true, run DAP on the center RGB and use it to linearly recalibrate the
-  # gpt-image-2 depth ERPs. Requires DAP weights & a working torch+CUDA env.
-  use_dap_fallback: false
-  dap_weights_dir: ""
-  # Depth decode range (meters). gpt-image-2 grayscale depth is mapped linearly
-  # near=white(255) -> near_m, far=black(0) -> far_m.
+  # Depth-Anything-V2 model size: "small" (99M) | "base" (335M) | "large" (1.0B).
+  # All three are pulled from HuggingFace and cached under ~/.cache/huggingface/.
+  dap_model_size: "base"
+  # ERP depth handling: "direct" (one DAP pass on the ERP, fast, slight polar
+  # distortion) | "cubemap_split" (6 DAP passes on cubemap faces, slower).
+  dap_mode: "direct"
+  # Robust 5/95-percentile linear scaling maps DAP relative depth into this range.
   depth_near_m: 0.3
   depth_far_m: 12.0
+  # Legacy switches kept for backwards-compat; the new pipeline always uses DAP.
+  use_dap_fallback: false
+  dap_weights_dir: ""
 
 perspective:
   # "cubemap" (6 views per pose) | "dodeca" (18 views per pose).
