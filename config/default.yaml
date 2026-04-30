@@ -72,10 +72,22 @@ nvs:
   depth_far_m: 12.0
 
 perspective:
-  # "cubemap" (6 views per pose) | "dodeca" (18 views per pose).
-  scheme: "cubemap"
+  # "cubemap"        : 6 faces per pose
+  # "persp16"        : 16 views per pose (8 yaw x 2 pitch at +-30 deg, FOV=90)
+  # "persp48_zigzag" : 12 yaw x 4 pitch = 48 views per pose, ordered as a
+  #                    column-first zigzag (adjacent frames differ in only
+  #                    one axis) so the sequence reads as video to SAM3.
+  scheme: "persp48_zigzag"
   fov_deg: 90.0
   out_size: 1024
+  # When true, every perspective RGB face is regenerated through gpt-image-2
+  # using the original face as a reference image to add native 1024-px detail
+  # that the 1024x512 ERP source could not carry. Costs one API call per face,
+  # i.e. (16 views) * (num_poses) calls. Disable for fast iteration.
+  enhance_with_image2: false
+  # Optional: only enhance the center pose (pose_idx == 0). Cheaper and still
+  # gives the rendered ERP a clear quality bump.
+  enhance_only_center_pose: false
 
 fastgs:
   # Path to the cloned FastGS repo (auto-detect if empty).

@@ -15,6 +15,7 @@ pose.R @ FACE_ROT[name].
 from __future__ import annotations
 
 import json
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, List
@@ -22,7 +23,7 @@ from typing import Iterable, List
 import numpy as np
 from PIL import Image
 
-from .poses import Pose
+from .poses import Pose, look_at_R
 from .warp import erp_dirs_to_uv
 
 
@@ -53,6 +54,185 @@ CUBEMAP_FACES: dict[str, np.ndarray] = {
 
 def cubemap_face_names() -> list[str]:
     return list(CUBEMAP_FACES.keys())
+
+
+def _persp16_face_rotations() -> dict[str, np.ndarray]:
+    """16 perspective view rotations (R_erp_from_face): 8 yaw x 2 pitch.
+
+    Layout chosen to give roughly 50% inter-view overlap when paired with a
+    90 degree FOV, which is what 3DGS training likes for solid SfM matches:
+
+      * 8 yaw stops (every 45 deg) at pitch = -30 deg ("low")  -> covers floor + walls
+      * 8 yaw stops (every 45 deg) at pitch = +30 deg ("high") -> covers ceiling + walls
+
+    Pitch is applied as a rotation about the camera's local +Y axis (left). In
+    our face frame +X is forward, +Y is left, +Z is up, so a positive rotation
+    about Y tilts the camera *down* and a negative one tilts it up. We want
+    "high" (look up) -> rotation_y = -pitch and "low" (look down) -> rotation_y
+    = +pitch.
+    """
+    rotations: dict[str, np.ndarray] = {}
+    pitch_deg = 30.0
+    for yaw_idx in range(8):
+        yaw = yaw_idx * (np.pi / 4.0)  # 0, 45, 90, ...
+        Rz = _Rz(-yaw)  # Rz(-yaw) so yaw=0 -> +X, yaw=90 -> -Y, ... matches cubemap
+        for tier_name, tier_sign in (("low", +1.0), ("high", -1.0)):
+            Ry = _Ry(tier_sign * np.deg2rad(pitch_deg))
+            # apply yaw first then pitch in the face local frame
+            R_erp_from_face = Rz @ Ry
+            name = f"yaw{yaw_idx}_{tier_name}"
+            rotations[name] = R_erp_from_face
+    return rotations
+
+
+PERSP16_FACES: dict[str, np.ndarray] = _persp16_face_rotations()
+
+
+def persp16_face_names() -> list[str]:
+    return list(PERSP16_FACES.keys())
+
+
+# ---------------------------------------------------------------------------
+# persp48_zigzag: 12 yaw x 4 pitch = 48 views per pose, ordered as a column-
+# first zigzag so adjacent frames change in only one axis. This is the format
+# SAM3 expects when consuming a perspective sequence as "video".
+#
+#   yaws    = [0, 30, 60, ..., 330]                       # 12 columns
+#   pitches = [+45, +15, -15, -45]                        # 4 rows (deg, +up)
+#
+# zigzag rule:
+#   even columns (yaw=0, 60, 120, ...): pitch goes +45 -> -45 (top to bottom)
+#   odd columns  (yaw=30, 90, 150, ...): pitch goes -45 -> +45 (bottom to top)
+#
+# face name format: "frame_{NNN:03d}_yaw{YAW}_pitch{+/-PITCH}"
+# ---------------------------------------------------------------------------
+
+
+PERSP48_YAWS_DEG: tuple[float, ...] = tuple(float(k * 30.0) for k in range(12))
+PERSP48_PITCHES_DEG: tuple[float, ...] = (45.0, 15.0, -15.0, -45.0)
+
+
+def _format_pitch(p: float) -> str:
+    sign = "+" if p >= 0 else "-"
+    return f"{sign}{int(round(abs(p)))}"
+
+
+def _persp48_zigzag_face_rotations() -> "OrderedDict[str, np.ndarray]":
+    """48 perspective view rotations (R_erp_from_face) in column-first zigzag.
+
+    Built via `look_at_R(forward, world_up=+Z)`, so:
+      - "forward" of every face goes to the (yaw_deg, pitch_deg) direction
+        in the ERP camera frame, where ERP convention is
+        theta = (u/W - 0.5) * 2*pi  (+Y at azimuth = +90 deg, +X at azimuth=0)
+      - "up" of every face is the +Z-aligned cross product, so roll == 0 by
+        construction (horizon stays horizontal in the perspective view).
+
+    Frame names follow the SAM3-friendly column-first zigzag pattern:
+      col 0  yaw=  0:  pitch +45 -> +15 -> -15 -> -45    (frames  0..3)
+      col 1  yaw= 30:  pitch -45 -> -15 -> +15 -> +45    (frames  4..7)
+      ...
+    Adjacent frames differ in only one axis (yaw or pitch but not both).
+    """
+    rotations: "OrderedDict[str, np.ndarray]" = OrderedDict()
+    world_up = np.array([0.0, 0.0, 1.0])
+    frame_idx = 0
+    for col, yaw_deg in enumerate(PERSP48_YAWS_DEG):
+        pitches = (
+            PERSP48_PITCHES_DEG if (col % 2 == 0)
+            else tuple(reversed(PERSP48_PITCHES_DEG))
+        )
+        yaw = np.deg2rad(yaw_deg)
+        for pitch_deg in pitches:
+            pitch = np.deg2rad(pitch_deg)
+            fwd = np.array([
+                np.cos(pitch) * np.cos(yaw),
+                np.cos(pitch) * np.sin(yaw),
+                np.sin(pitch),
+            ])
+            R_erp_from_face = look_at_R(fwd, world_up=world_up)
+            yaw_token = f"yaw{int(round(yaw_deg))}"
+            pitch_token = f"pitch{_format_pitch(pitch_deg)}"
+            name = f"frame_{frame_idx:03d}_{yaw_token}_{pitch_token}"
+            rotations[name] = R_erp_from_face
+            frame_idx += 1
+    return rotations
+
+
+PERSP48_ZIGZAG_FACES: "OrderedDict[str, np.ndarray]" = _persp48_zigzag_face_rotations()
+
+
+def persp48_zigzag_face_names() -> list[str]:
+    return list(PERSP48_ZIGZAG_FACES.keys())
+
+
+def persp48_zigzag_yaw_pitch() -> list[tuple[float, float]]:
+    """Return the (yaw_deg, pitch_deg) sequence in zigzag order, one per frame."""
+    out: list[tuple[float, float]] = []
+    for col, yaw_deg in enumerate(PERSP48_YAWS_DEG):
+        pitches = (
+            PERSP48_PITCHES_DEG if (col % 2 == 0)
+            else tuple(reversed(PERSP48_PITCHES_DEG))
+        )
+        for pitch_deg in pitches:
+            out.append((float(yaw_deg), float(pitch_deg)))
+    return out
+
+
+def _persp16_4x4_face_rotations() -> "OrderedDict[str, np.ndarray]":
+    """16 perspective views per pose, 4 azimuth x 4 elevation.
+
+    Matches FastGS-Instance/scripts/erp_to_perspective.py defaults:
+      azimuths   = [0, 90, 180, 270]
+      elevations = [+45, +15, -15, -45]
+      FOV        = 90 deg
+
+    Built via `look_at_R(forward, world_up=+Z)` to be roll-free, with the
+    same yaw-sign convention as persp48_zigzag (i.e. yaw=90 deg points to
+    azimuth=+90 deg = +Y direction in our ERP camera frame).
+
+    Frame names: frame_NNN_az<deg>_el<+/-deg> in row-major
+    (elevation outer, azimuth inner) order.
+    """
+    rotations: "OrderedDict[str, np.ndarray]" = OrderedDict()
+    azimuths = (0.0, 90.0, 180.0, 270.0)
+    elevations = (45.0, 15.0, -15.0, -45.0)
+    world_up = np.array([0.0, 0.0, 1.0])
+    frame_idx = 0
+    for el in elevations:
+        for az in azimuths:
+            yaw = np.deg2rad(az)
+            pitch = np.deg2rad(el)
+            fwd = np.array([
+                np.cos(pitch) * np.cos(yaw),
+                np.cos(pitch) * np.sin(yaw),
+                np.sin(pitch),
+            ])
+            R_erp_from_face = look_at_R(fwd, world_up=world_up)
+            sign = "+" if el >= 0 else "-"
+            name = f"frame_{frame_idx:03d}_az{int(round(az))}_el{sign}{int(round(abs(el)))}"
+            rotations[name] = R_erp_from_face
+            frame_idx += 1
+    return rotations
+
+
+PERSP16_4X4_FACES: "OrderedDict[str, np.ndarray]" = _persp16_4x4_face_rotations()
+
+
+def persp16_4x4_face_names() -> list[str]:
+    return list(PERSP16_4X4_FACES.keys())
+
+
+def _faces_for_scheme(scheme: str) -> dict[str, np.ndarray]:
+    s = (scheme or "cubemap").lower()
+    if s == "cubemap":
+        return CUBEMAP_FACES
+    if s == "persp16":
+        return PERSP16_FACES
+    if s == "persp48_zigzag":
+        return PERSP48_ZIGZAG_FACES
+    if s == "persp16_4x4":
+        return PERSP16_4X4_FACES
+    raise ValueError(f"unknown perspective scheme: {scheme!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +338,7 @@ class PoseFaceSet:
     faces: List[FaceView] = field(default_factory=list)
 
 
-def split_pose_to_cubemap(
+def split_pose_to_perspectives(
     *,
     pose_idx: int,
     pose: Pose,
@@ -166,19 +346,22 @@ def split_pose_to_cubemap(
     depth_erp_m: np.ndarray,
     normal_erp_world: np.ndarray | None,
     out_dir: Path,
+    scheme: str = "cubemap",
     fov_deg: float = 90.0,
     out_size: int = 1024,
     face_names: list[str] | None = None,
 ) -> PoseFaceSet:
-    """Split one pose's ERP triplet into 6 cubemap views, write images to disk.
+    """Split one pose's ERP triplet into perspective views and write to disk.
 
-    `normal_erp_world` is expected in the WORLD frame (decode + rotate by pose.R).
-    Pass None to skip writing normal images.
+    `scheme` selects the camera layout: "cubemap" (6 faces) or "persp16"
+    (8 yaw x 2 pitch = 16 views). `normal_erp_world` is expected in the WORLD
+    frame (decode + rotate by pose.R). Pass None to skip writing normal images.
     """
     H, W = depth_erp_m.shape
     if rgb_erp.shape[:2] != (H, W):
         raise ValueError("rgb and depth ERPs must have same H/W")
-    face_names = face_names or cubemap_face_names()
+    face_table = _faces_for_scheme(scheme)
+    face_names = face_names or list(face_table.keys())
     f = (out_size * 0.5) / np.tan(np.deg2rad(fov_deg) * 0.5)
     K = np.array([[f, 0.0, out_size * 0.5], [0.0, f, out_size * 0.5], [0.0, 0.0, 1.0]])
     persp_root = out_dir / f"pose_{pose_idx}"
@@ -192,7 +375,7 @@ def split_pose_to_cubemap(
     normal_arr = normal_erp_world.astype(np.float32) if normal_erp_world is not None else None
     pose_set = PoseFaceSet(pose_idx=pose_idx, pose=pose)
     for fname in face_names:
-        Rerp_from_face = CUBEMAP_FACES[fname]
+        Rerp_from_face = face_table[fname]
         # dirs in ERP frame: (out, out, 3) = dirs_face @ Rerp_from_face^T
         dirs_erp = dirs_face @ Rerp_from_face.T.astype(np.float32)
         u_erp, v_erp = _erp_sample_uv(dirs_erp, W, H)
@@ -233,17 +416,24 @@ def split_pose_to_cubemap(
     return pose_set
 
 
-def split_all_to_cubemap(
+# Backwards-compatible alias used by existing call sites / tests.
+def split_pose_to_cubemap(**kwargs) -> PoseFaceSet:
+    kwargs.setdefault("scheme", "cubemap")
+    return split_pose_to_perspectives(**kwargs)
+
+
+def split_all_to_perspectives(
     *,
     poses: List[Pose],
     rgb_erps: List[np.ndarray],
     depth_erps_m: List[np.ndarray],
     normal_erps_world: List[np.ndarray] | None,
     out_dir: Path,
+    scheme: str = "cubemap",
     fov_deg: float = 90.0,
     out_size: int = 1024,
 ) -> tuple[List[PoseFaceSet], Path]:
-    """Run `split_pose_to_cubemap` for every pose and dump cameras.json."""
+    """Run `split_pose_to_perspectives` for every pose and dump cameras.json."""
     if not (len(poses) == len(rgb_erps) == len(depth_erps_m)):
         raise ValueError("poses / rgb / depth length mismatch")
     if normal_erps_world is not None and len(normal_erps_world) != len(poses):
@@ -253,13 +443,14 @@ def split_all_to_cubemap(
     sets: List[PoseFaceSet] = []
     for i, pose in enumerate(poses):
         nrm = normal_erps_world[i] if normal_erps_world is not None else None
-        s = split_pose_to_cubemap(
+        s = split_pose_to_perspectives(
             pose_idx=i,
             pose=pose,
             rgb_erp=rgb_erps[i],
             depth_erp_m=depth_erps_m[i],
             normal_erp_world=nrm,
             out_dir=out_dir,
+            scheme=scheme,
             fov_deg=fov_deg,
             out_size=out_size,
         )
@@ -270,7 +461,7 @@ def split_all_to_cubemap(
             {
                 "fov_deg": float(fov_deg),
                 "out_size": int(out_size),
-                "scheme": "cubemap",
+                "scheme": str(scheme),
                 "views": [face.__dict__ for s in sets for face in s.faces],
             },
             indent=2,
@@ -278,6 +469,12 @@ def split_all_to_cubemap(
         encoding="utf-8",
     )
     return sets, cameras_json
+
+
+# Backwards-compatible alias.
+def split_all_to_cubemap(**kwargs) -> tuple[List[PoseFaceSet], Path]:
+    kwargs.setdefault("scheme", "cubemap")
+    return split_all_to_perspectives(**kwargs)
 
 
 # ---------------------------------------------------------------------------
