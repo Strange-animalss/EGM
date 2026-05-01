@@ -1,106 +1,137 @@
-# Default configuration for the ERP -> NVS -> FastGS -> Spark.js pipeline.
-# All values are overridable on the command line via OmegaConf dotlist
-# (e.g. `python scripts/generate_erp.py cuboid.size_xyz=[6,6,3]`).
+﻿# Default EGMOR configuration.
+#
+# ============================================================================
+# PROVIDER CONFIG EXAMPLES — uncomment one block, leave the others as comments.
+# Switching the API source is just a few lines under `openai:` below.
+# ============================================================================
+#
+# Option 1: OpenAI DIRECT (cleanest, gpt-image-2 supports any size up to ~3840
+#                          long-edge, multiples of 16, ratio <= 3:1)
+#   provider: "openai"
+#   base_url: ""                              # empty = api.openai.com
+#   api_key_env: "OPENAI_API_KEY"
+#   model: "gpt-image-2"
+#   text_model: "gpt-5.5-pro"
+#   size: "2048x1024"                         # real 2:1 ERP
+#
+# Option 2: OpenAI-compatible relay (super.shangliu.org / OneAPI / LiteLLM ...)
+#   provider: "openai"                        # SAME path as Option 1
+#   base_url: "https://super.shangliu.org/v1"
+#   api_key_env: "OPENAI_API_KEY"             # relay-issued key
+#   model: "gpt-image-2"                      # relay must route to real
+#                                             # gpt-image-2, NOT gpt-image-1.5
+#   text_model: "gpt-5.5"                     # some relays don't have -pro
+#   size: "2048x1024"
+#
+# Option 3: OpenRouter (fallback only — output locked to 1024x1024,
+#                       no /v1/images/edits endpoint, no size override)
+#   provider: "openrouter"
+#   base_url: "https://openrouter.ai/api/v1"
+#   api_key_env: "OPENAI_API_KEY"             # sk-or-v1-... key
+#   model: "openai/gpt-image-2"               # or "openai/gpt-5.4-image-2"
+#   text_model: "openai/gpt-5.5-pro"
+#   size: "1024x1024"                         # OpenRouter cannot do 2:1
+# ============================================================================
+
 
 cuboid:
   # Cuboid space (meters). x = width, y = depth, z = height.
   size_xyz: [4.0, 4.0, 3.0]
-  # World coordinate of the cuboid center (where the initial pose lives by default).
   center_world: [0.0, 0.0, 1.5]
   # Fraction by which corner poses are pulled toward the center.
-  # 0.0 = exactly at the corner. 0.5 = halfway between corner and center.
   corner_inset: 0.20
-  # Where corner poses look at: "center" | "outward" | "random".
+  # "center"  — every corner camera looks at the room centroid (default).
+  # "outward" — every corner camera looks away from the room centroid.
+  # "random"  — bounded yaw/pitch jitter, useful for ablations.
+  # "level"   — identity rotation (same orientation as pose_0). Keeps the
+  #             ERP poles aligned with world up/down across all 9 views; the
+  #             cleanest match for how panorama models are trained, and the
+  #             cheapest geometric assumption for warp+inpaint.
   corner_lookat: "center"
 
 poses:
   initial:
-    # Local offset relative to cuboid.center_world.
     xyz_local: [0.0, 0.0, 0.0]
-    # Euler angles (xyz, intrinsic, degrees). Identity = looking +X (yaw=0).
     euler_xyz_deg: [0.0, 0.0, 0.0]
-  # "auto_8_corners" | list of poses (each {xyz_local: [..], euler_xyz_deg: [..]}).
+  # "auto_8_corners" | list of poses
   generation: "auto_8_corners"
 
 openai:
-  model: "gpt-image-2"
-  # ERP requires 2:1. 3840x1920 satisfies <=3840 long edge and <=3:1 ratio.
-  size: "3840x1920"
-  rgb_quality: "high"
-  edit_quality: "high"
+  # OpenAI-compatible relay: ChatFire (Images + Chat share this base_url + relay key).
+  # Official OpenAI: set `base_url: ""` and use an OpenAI `sk-...` key in secrets.local.yaml.
+  provider: "openai"
+  base_url: "https://api.chatfire.cn/v1"
   api_key_env: "OPENAI_API_KEY"
-  request_timeout_sec: 180
+  # Leave empty in git. For YAML-stored key on YOUR machine only: use
+  # `config/secrets.local.yaml` (see secrets.local.yaml.example; file is gitignored).
+  api_key: ""                                  # NEVER commit a real key in default.yaml
+  model: "gpt-image-2"
+  size: "2048x1024"
+  rgb_quality: "high"
+  request_timeout_sec: 600
   max_retries: 4
   retry_backoff_sec: 5.0
   cache_dir: "outputs/.openai_cache"
-  # Text model for scene prompt expansion (GPT-5.5-pro deep reasoning).
-  text_model: "gpt-5.5-pro"
+  # Must support `v1/chat/completions` (SceneExpander). Override in secrets.local if needed.
+  text_model: "gpt-4o-mini"
   text_model_api_key_env: "OPENAI_API_KEY"
   reasoning_effort: "high"
-  # Deep reasoning for gpt-image-2 generate/edit calls (null = disabled).
-  image_reasoning_effort: "medium"
+  # OpenRouter ranking headers; harmless on other providers.
+  http_referer: "https://github.com/Strange-animalss/EGMOR"
+  app_title: "EGMOR"
+
+# How to drive corner poses from the centre RGB.
+#   * "warp_inpaint" — forward-warp centre RGBD to the corner pose, build a
+#     hole mask, then call images.edit(image=warped_rgb, mask=hole_mask,
+#     prompt) so the model only fills disocclusions. Strongest geometric
+#     consistency between the 9 ERPs.
+#   * "i2i"          — images.edit with the centre RGB as the reference and
+#     no mask (whole-image i2i).
+#   * "generate"     — text-to-image only, no reference. Weakest consistency.
+nvs_strategy:
+  corner_method: "warp_inpaint"
+  hole_dilate_px: 4
+
+# Optional gpt-image-2 "decoder" experiment: ask the model to convert a
+# generated RGB ERP into a depth or normal map, save the result, and compare
+# against DAP-V2 / analytic normals (the trusted ground truth used by every
+# downstream stage). Only the listed pose indices are run, to keep API
+# budget bounded.
+decoder_experiment:
+  enabled: true
+  experiment_poses: [0, 4]
 
 prompt:
-  scene_default: "coffee shop"
-  randomize: true
-  # null = a fresh random seed per run; integer = reproducible.
+  scene_default: "an empty specialty coffee shop, late morning"
+  # null = fresh seed each run; integer = reproducible (subject to LLM determinism).
   seed: null
-  style_pool: ["scandinavian", "industrial loft", "vintage parisian", "japandi", "tropical"]
-  light_pool:
-    - "soft morning sun streaming through tall windows"
-    - "rainy afternoon, gloomy diffuse light, condensation on glass"
-    - "neon-lit dusk, magenta and teal accents"
-    - "warm tungsten night, candlelight reflections"
-  occupancy_pool: ["empty", "a couple of patrons reading", "busy peak hours, baristas working"]
-  extra_props_pool:
-    - "wooden floor, exposed brick, espresso machine, chalkboard menu, hanging plants"
-    - "marble counter, leather banquettes, brass pendant lights, art prints on walls"
-    - "concrete floor, pine tables, minimalist white shelves, ceramic mugs lined up"
-    - "rattan chairs, jute rugs, large monstera plants, woven wall art"
 
 nvs:
-  # "hybrid" (center independent + corners warp+inpaint) | "independent" | "warp_inpaint_only".
-  strategy: "hybrid"
-  hole_dilate_px: 6
-  # When true, run DAP on the center RGB and use it to linearly recalibrate the
-  # gpt-image-2 depth ERPs. Requires DAP weights & a working torch+CUDA env.
-  use_dap_fallback: false
-  dap_weights_dir: ""
-  # Depth decode range (meters). gpt-image-2 grayscale depth is mapped linearly
-  # near=white(255) -> near_m, far=black(0) -> far_m.
+  # Depth-Anything-V2 model size. small | base | large.
+  dap_model_size: "base"
+  # Robust 5/95-percentile linear scale into [depth_near_m, depth_far_m].
   depth_near_m: 0.3
   depth_far_m: 12.0
 
 perspective:
-  # "cubemap" (6 views per pose) | "dodeca" (18 views per pose).
-  scheme: "cubemap"
+  # 12 yaw x 4 pitch = 48 views, column-first zigzag (SAM3-video friendly).
+  scheme: "persp48_zigzag"
   fov_deg: 90.0
   out_size: 1024
 
 fastgs:
-  # Path to the cloned FastGS repo (auto-detect if empty).
-  repo_path: "third_party/FastGS"
-  iterations: 7000
-  # When true, write the back-projected sparse cloud as points3D.txt and let
-  # FastGS use it instead of running COLMAP SfM.
+  repo_path: "third_party/FastGS-Instance/FastGS"
+  iterations: 1500
   init_from_points3d: true
-  # Max points in the initial cloud (we voxel-downsample to this).
   init_max_points: 200000
   init_voxel_m: 0.04
-  # Extra command-line args to forward to FastGS train.py.
   extra_args: []
 
 viewer:
   port: 8765
   bind: "127.0.0.1"
-  # If empty, serve_viewer.py picks the latest run under outputs/runs/.
   default_run_id: ""
 
 run:
-  # Where everything per-run goes.
   outputs_dir: "outputs/runs"
-  # Auto-incremented if empty.
   run_id: ""
-
-mock:
-  enabled: false

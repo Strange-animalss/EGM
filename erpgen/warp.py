@@ -1,4 +1,4 @@
-"""ERP forward warp utilities (vectorized numpy).
+﻿"""ERP forward warp utilities (vectorized numpy).
 
 Given a source ERP image with metric depth and a source pose, project every
 pixel into a target ERP at a target pose using simple z-buffered scatter.

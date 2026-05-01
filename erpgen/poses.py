@@ -166,19 +166,30 @@ def make_eight_corner_poses(cfg: DictConfig, *, seed: int | None = None) -> List
     poses: List[Pose] = []
     for k, off in enumerate(_corner_offsets(size, inset)):
         xyz = center + off
-        if mode == "center":
-            forward = center - xyz
-        elif mode == "outward":
-            forward = xyz - center
-        elif mode == "random":
-            yaw = rng.uniform(-np.pi, np.pi)
-            pitch = rng.uniform(-np.deg2rad(15), np.deg2rad(15))
-            forward = np.array(
-                [np.cos(pitch) * np.cos(yaw), np.cos(pitch) * np.sin(yaw), np.sin(pitch)]
-            )
+        if mode == "level":
+            # Identity rotation: every corner pose has the same orientation as
+            # pose_0 (camera looks horizontally along world +X). No pitch / no
+            # roll, so the ERP poles always coincide with world up/down. This
+            # matches how gpt-image-2 was trained on level panoramas, gives
+            # cleaner pole regions, and removes the only-tilt source of seam
+            # mismatch between adjacent corner views.
+            R = np.eye(3, dtype=np.float64)
         else:
-            raise ValueError(f"unknown corner_lookat: {mode!r}")
-        R = look_at_R(forward)
+            if mode == "center":
+                forward = center - xyz
+            elif mode == "outward":
+                forward = xyz - center
+            elif mode == "random":
+                yaw = rng.uniform(-np.pi, np.pi)
+                pitch = rng.uniform(-np.deg2rad(15), np.deg2rad(15))
+                forward = np.array(
+                    [np.cos(pitch) * np.cos(yaw),
+                     np.cos(pitch) * np.sin(yaw),
+                     np.sin(pitch)]
+                )
+            else:
+                raise ValueError(f"unknown corner_lookat: {mode!r}")
+            R = look_at_R(forward)
         poses.append(Pose(xyz=xyz, R=R, name=f"pose_{k + 1}_corner"))
     return poses
 

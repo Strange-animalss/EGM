@@ -87,9 +87,9 @@ def run_fastgs(
 
     cmd = [
         sys.executable,
-        str(train_script),
-        "--source_path", str(colmap_dir),
-        "--model_path", str(gs_dir),
+        str(train_script.resolve()),
+        "--source_path", str(colmap_dir.resolve()),
+        "--model_path", str(gs_dir.resolve()),
         "--iterations", str(int(cfg.fastgs.iterations)),
     ]
     extra = OmegaConf.to_container(cfg.fastgs.extra_args, resolve=True) or []

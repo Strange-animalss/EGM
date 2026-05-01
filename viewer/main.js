@@ -80,6 +80,9 @@ function updateHud() {
   lines.push("");
   lines.push(`ply: ${plyUrl}`);
   lines.push("WASD/arrows + mouse drag (orbit)");
+  lines.push(
+    "ERP 360 (1x/4x): erp360.html" + (runId ? `?run=${encodeURIComponent(runId)}` : "")
+  );
   hud.textContent = lines.join("\n");
 }
 

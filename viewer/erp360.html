@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ERP 360 — 升采样对比</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #0b0d10;
+        color: #e6edf3;
+        font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      }
+      #app {
+        position: fixed;
+        inset: 0;
+        touch-action: none;
+      }
+      #hud {
+        position: fixed;
+        top: 12px;
+        left: 12px;
+        right: 12px;
+        max-width: 420px;
+        padding: 10px 12px;
+        background: rgba(11, 13, 16, 0.78);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 8px;
+        font-size: 12px;
+        line-height: 1.45;
+        backdrop-filter: blur(6px);
+      }
+      #hud b {
+        color: #fbbf24;
+      }
+      #hud .row {
+        margin-top: 8px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+      }
+      #hud button {
+        cursor: pointer;
+        background: rgba(255, 255, 255, 0.08);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        color: #e6edf3;
+        border-radius: 4px;
+        padding: 4px 10px;
+        font-size: 12px;
+      }
+      #hud button:hover {
+        background: rgba(255, 255, 255, 0.14);
+      }
+      #hud button.active {
+        border-color: #38bdf8;
+        color: #7dd3fc;
+      }
+      #hud input[type="number"] {
+        width: 52px;
+        background: rgba(0, 0, 0, 0.35);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        color: #e6edf3;
+        border-radius: 4px;
+        padding: 4px 6px;
+        font-size: 12px;
+      }
+      #hud input[type="text"] {
+        flex: 1;
+        min-width: 0;
+        background: rgba(0, 0, 0, 0.35);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        color: #e6edf3;
+        border-radius: 4px;
+        padding: 5px 8px;
+        font-size: 12px;
+      }
+      #hud .pick-row {
+        margin-top: 6px;
+      }
+      #status {
+        position: fixed;
+        bottom: 12px;
+        left: 12px;
+        font-size: 12px;
+        color: #94a3b8;
+        max-width: 90vw;
+        word-break: break-all;
+      }
+      .err {
+        color: #f87171 !important;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <div id="hud">
+      <b>ERP 360 查看器</b> — 拖拽环视，滚轮调视野（FOV）<br />
+      <span id="hud-lines"></span>
+      <div id="erp360-pick" class="row pick-row">
+        <button type="button" id="btn-pick-local">选择本地图片…</button>
+        <input type="file" id="input-local-file" accept="image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp" hidden />
+      </div>
+      <div class="row pick-row">
+        <input
+          type="text"
+          id="input-outputs-rel"
+          placeholder="outputs 下相对路径，如 _erp_native_probe/foo.png"
+          spellcheck="false"
+          autocomplete="off"
+        />
+        <button type="button" id="btn-load-outputs">从服务器加载</button>
+      </div>
+      <div class="row pick-row">
+        <button type="button" id="btn-clear-custom">清除自定义贴图</button>
+      </div>
+      <div id="erp360-run-controls">
+        <div class="row">
+          <span>分辨率</span>
+          <button type="button" id="btn-4x" class="active">4x 超分</button>
+          <button type="button" id="btn-1x">1x 原始</button>
+        </div>
+        <div class="row">
+          <span>Pose</span>
+          <button type="button" id="pose-prev">←</button>
+          <input type="number" id="pose-input" min="0" value="0" />
+          <button type="button" id="pose-next">→</button>
+          <span id="pose-of"></span>
+        </div>
+      </div>
+    </div>
+    <div id="status"></div>
+
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.180.0/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/"
+        }
+      }
+    </script>
+    <script type="module" src="./erp360.js"></script>
+  </body>
+</html>

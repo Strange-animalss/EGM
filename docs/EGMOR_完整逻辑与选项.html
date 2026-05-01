@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>EGMOR — 完整工作逻辑与可配置选项</title>
+  <style>
+    :root {
+      --bg: #faf9f7;
+      --text: #1a1a1a;
+      --muted: #5c5c5c;
+      --border: #e0ddd8;
+      --accent: #2c5282;
+      --code-bg: #f0eeeb;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 2rem 1.25rem 4rem;
+      font-family: "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      font-size: 17px;
+      line-height: 1.65;
+      color: var(--text);
+      background: var(--bg);
+      max-width: 52rem;
+      margin-left: auto;
+      margin-right: auto;
+    }
+    h1 {
+      font-size: 1.75rem;
+      font-weight: 650;
+      margin-top: 0;
+      border-bottom: 2px solid var(--border);
+      padding-bottom: 0.6rem;
+    }
+    h2 {
+      font-size: 1.35rem;
+      margin-top: 2.25rem;
+      color: var(--accent);
+    }
+    h3 { font-size: 1.12rem; margin-top: 1.5rem; }
+    p { margin: 0.75rem 0; }
+    .lead { color: var(--muted); font-size: 0.95rem; margin-bottom: 1.5rem; }
+    pre {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 1rem 1.1rem;
+      overflow-x: auto;
+      font-size: 0.82rem;
+      line-height: 1.45;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 1rem 0;
+      font-size: 0.92rem;
+    }
+    th, td {
+      border: 1px solid var(--border);
+      padding: 0.5rem 0.65rem;
+      text-align: left;
+      vertical-align: top;
+    }
+    th { background: #ebe8e3; font-weight: 600; }
+    tr:nth-child(even) td { background: rgba(0,0,0,0.02); }
+    code {
+      font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+      font-size: 0.88em;
+      background: var(--code-bg);
+      padding: 0.12em 0.35em;
+      border-radius: 4px;
+    }
+    hr { border: none; border-top: 1px solid var(--border); margin: 2rem 0; }
+    ul { margin: 0.5rem 0; padding-left: 1.35rem; }
+    li { margin: 0.35rem 0; }
+    .note {
+      background: #fff8e6;
+      border-left: 4px solid #c9a227;
+      padding: 0.75rem 1rem;
+      margin: 1rem 0;
+    }
+  </style>
+</head>
+<body>
+
+<h1>EGMOR / EGM — 完整工作逻辑与可配置选项</h1>
+<p class="lead">基于仓库当前 Python 源码整理：文本 → 360° ERP → DAP 深度与解析法线 → 透视切分 → COLMAP →（可选 4×）→ Gaussian Splatting。表格内为各阶段可对比选项。</p>
+
+<h2>1. 项目在做什么</h2>
+<p><strong>目标</strong>：用自然语言描述静态空室内场景，生成可漫游的 3D Gaussian Splatting（<code>.ply</code>）。</p>
+<p><strong>核心链路</strong>：LLM 扩写场景 → 9 个位姿各一张 ERP RGB → DAP-V2 深度 + 解析法线 → 透视图 + COLMAP + 初始点云 → 可选 Real-ESRGAN 4× 与重建透视 → <code>splatfacto</code> 或 FastGS 训练 → 浏览器 viewer。</p>
+
+<h2>FAQ：Pose、首张图、Warp、OpenAI 官方 gpt-image-2</h2>
+
+<h3>Pose 是否从第一张全景估计？</h3>
+<p><strong>否。</strong> 九个 <code>xyz</code> 与 <code>R</code> 由 <code>cuboid</code> + <code>poses.*</code> 在 <code>poses.py</code> 中<strong>解析生成</strong>，在调用图像 API 之前已固定（见 <code>poses.json</code>），不是从首张图做视觉定位或 COLMAP BA 反推。</p>
+
+<h3>那「后面位置」如何谈准确？</h3>
+<p>区分两类问题：（1）<strong>外参几何</strong>——由你配置的虚拟房间决定，用于 warp / 透视采样 / 写 COLMAP；（2）<strong>多视角 RGB 是否像同一间房</strong>——靠提示词与 <code>warp_inpaint</code>（中心 DAP 深度 + <code>forward_warp_erp</code> + mask inpaint）、<code>i2i</code> 或裸 <code>generate</code>。深度每张单独 DAP，是相对深度经分位数映射到 <code>[depth_near_m, depth_far_m]</code> 的工程标定，不是激光雷达真值。</p>
+
+<h3>Warp 的作用</h3>
+<p><code>warp.py</code>：源 ERP 像素 × 源深度 → 世界点 → 投到目标 ERP，z-buffer 合成；空洞膨胀后作为 OpenAI <code>images.edit</code> 需编辑区域，使角点图与中心诱导的 3D 结构对齐。</p>
+
+<h3>OpenAI 官方、效果、速度</h3>
+<p>官方：<code>provider=openai</code> 且默认主机或透传 <code>images</code> 的中继。<code>warp_inpaint</code> 依赖标准 <code>images.edit</code>。效果与速度随模型、分辨率、<code>quality</code> 与网络变化；DAP 一般为 GPU 亚秒～数秒级。</p>
+
+<h3>官方 <code>gpt-image-2</code> 一次出图（<code>docs/</code>）</h3>
+<p>运行 <code>python scripts/docs_sample_gpt_image2_official.py</code>（需环境变量 <code>OPENAI_API_KEY</code>）生成 <code>docs/openai_official_gpt_image2_sample.png</code> 与元数据 <code>docs/openai_official_gpt_image2_sample.json</code>。无密钥时仅写入 <code>ok:false</code> 的 JSON，不生成 PNG。</p>
+<pre>$env:OPENAI_API_KEY = "sk-..."
+python scripts/docs_sample_gpt_image2_official.py</pre>
+<p><strong>示例图</strong>（成功运行脚本后文件才存在；下图链接与 Markdown 一致）：</p>
+<figure style="margin:1rem 0;">
+  <img src="openai_official_gpt_image2_sample.png" alt="OpenAI 官方 gpt-image-2 一次出图" style="max-width:100%;height:auto;border:1px solid var(--border);border-radius:6px;" width="512" loading="lazy" />
+  <figcaption style="font-size:0.88rem;color:var(--muted);margin-top:0.35rem;">若图片无法加载，请在本机设置密钥后运行上述脚本生成 PNG。</figcaption>
+</figure>
+
+<h2>2. 端到端流水线</h2>
+<pre>用户场景文本
+    → SceneExpander（可 --no-expand 跳过）
+    → build_pose_set（9 Pose）
+    → run_hybrid_nvs（LLM RGB + DAP + 法线）
+    → split_all_to_perspectives
+    → build_init_pcd + write_colmap_sparse
+    →（可选）sr_erp_4x.py / regenerate_persp_4x.py
+    → train_gs.py → serve_viewer.py</pre>
+<p>主入口：<code>scripts/generate_erp.py</code> 中 <code>generate()</code> 完成 Stage 1。</p>
+
+<h2>3. Stage 1 模块逻辑</h2>
+
+<h3>3.1 配置</h3>
+<p><code>erpgen/config.py</code>：<code>load_config</code> + OmegaConf dotlist；<code>resolve_run_dir</code> 写入 <code>outputs/runs/&lt;run_id&gt;/</code> 与 <code>resolved_config.yaml</code>。</p>
+
+<h3>3.2 位姿 <code>poses.py</code></h3>
+<p>世界系 Z 向上；相机 <code>R</code> 为 world_from_camera，视线 +X。长方体由 <code>cuboid.*</code> 定义；<code>corner_lookat</code>：<code>center</code> | <code>outward</code> | <code>random</code> | <code>level</code>（角点与中心同向，极点对齐）。<code>poses.generation</code>：<code>auto_8_corners</code> 或显式列表。</p>
+
+<h3>3.3 场景扩写 <code>scene_expander.py</code></h3>
+<p>Chat 补全返回 JSON → <code>SceneSpec</code>；<code>prompts.build_prompt</code> 生成每位姿 ERP 提示。</p>
+
+<h3>3.4 NVS <code>nvs.py</code></h3>
+<p>中心：<code>generate_rgb</code>。角点：由 <code>nvs_strategy.corner_method</code> 决定。之后固定 <code>estimate_erp_depth(..., mode="direct")</code> 与 <code>normals_from_erp_depth</code>。若 warp/i2i 失败则后续角点退化为纯 <code>generate</code>。</p>
+
+<table>
+  <thead><tr><th>corner_method</th><th>行为</th><th>provider 注意</th></tr></thead>
+  <tbody>
+    <tr><td><code>warp_inpaint</code></td><td>中心 RGBD 前向 warp → 空洞 mask → <code>images.edit</code> 只填洞</td><td>需 <code>openai</code> 标准路径</td></tr>
+    <tr><td><code>i2i</code></td><td>整图参考 edit / chat i2i</td><td><code>openai</code> 或 <code>openrouter</code></td></tr>
+    <tr><td><code>generate</code></td><td>无参考文生图</td><td>任意</td></tr>
+  </tbody>
+</table>
+
+<h3>3.5 图像 API <code>openai_erp.py</code></h3>
+<p><code>openai</code>：<code>images.generate</code> / <code>images.edit</code>（含 mask），可配 <code>base_url</code> 走兼容中继。<code>openrouter</code>：仅 chat 多模态，输出约 1024²，无真 mask edit。请求 SHA256 磁盘缓存。</p>
+
+<h3>3.6 DAP <code>dap.py</code></h3>
+<p><code>nvs.dap_model_size</code>：<code>small</code> | <code>base</code> | <code>large</code>。库内支持 <code>cubemap_split</code>，但 NVS 当前写死 <code>direct</code>。</p>
+
+<h3>3.7 透视切分 <code>erp_to_persp.py</code></h3>
+<p><strong>当前 <code>_faces_for_scheme</code> 仅支持</strong>：<code>cubemap</code>（6）、<code>persp48_zigzag</code>（48，列优先 zigzag）。docstring 中提到的 <code>persp16</code> 若传入会 <code>ValueError</code>。</p>
+<p><code>perspective.fov_deg</code>、<code>out_size</code> 控制视场与分辨率。</p>
+
+<h3>3.8 COLMAP</h3>
+<p><code>init_pcd</code> 使用 <code>fastgs.init_max_points</code>、<code>init_voxel_m</code>；<code>write_colmap_sparse</code> 受 <code>fastgs.init_from_points3d</code> 控制是否写入 points3D。</p>
+
+<h3>3.9 Decoder 实验</h3>
+<p><code>decoder_experiment.enabled</code> 时，对指定 pose 调用 LLM 生成深度/法线图，与 DAP 对比写入 <code>decoder_vs_dap.json</code>；主几何仍用 DAP。</p>
+
+<h2>4. Stage 1.5：<code>sr_erp_4x.py</code></h2>
+<p>RGB：Real-ESRGAN + 水平 wrap padding。深度/法线：双线性 4×，不重跑 DAP。</p>
+
+<h2>5. Stage 2：<code>train_gs.py</code></h2>
+<p><code>splatfacto</code>：nerfstudio；失败可自动 fallback FastGS。<code>fastgs</code>：子进程，缺失时可 fallback 点云 PLY。</p>
+
+<h2>6. 常用配置键</h2>
+<table>
+  <thead><tr><th>配置路径</th><th>作用</th></tr></thead>
+  <tbody>
+    <tr><td><code>openai.*</code></td><td>图像/文本 API、模型、尺寸、质量、缓存</td></tr>
+    <tr><td><code>prompt.*</code> / CLI <code>--scene</code></td><td>场景句与 seed</td></tr>
+    <tr><td><code>cuboid.*</code> / <code>poses.*</code></td><td>房间与相机布局</td></tr>
+    <tr><td><code>nvs_strategy.*</code></td><td>角点 RGB 策略</td></tr>
+    <tr><td><code>nvs.*</code></td><td>DAP 体量与深度范围</td></tr>
+    <tr><td><code>perspective.*</code></td><td>切分方案与相机参数</td></tr>
+    <tr><td><code>fastgs.*</code></td><td>训练与初始化点云</td></tr>
+  </tbody>
+</table>
+
+<div class="note">
+  <strong>与 README 可能不一致：</strong>主路径不支持 <code>persp16</code>；<code>generate_erp.py</code> 当前无 <code>--mock</code>；NVS 未接配置里的 <code>dap_mode</code>（固定 direct）。以源码为准。
+</div>
+
+<hr />
+<p style="font-size:0.9rem;color:var(--muted);">同目录 Markdown：<code>EGMOR_完整逻辑与选项.md</code> 内容更全（含 API 来源对比表与脚本索引）。</p>
+
+</body>
+</html>

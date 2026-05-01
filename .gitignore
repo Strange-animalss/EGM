@@ -7,14 +7,18 @@ venv/
 env/
 .env
 .envrc
+config/secrets.local.yaml
 .idea/
 .vscode/
 .DS_Store
 Thumbs.db
 
-outputs/runs/
-outputs/cache/
-outputs/.openai_cache/
+outputs/
+.claude/
+.pr_split_temp/
+STATE.h5
+third_party/weights/
+third_party/FastGS-Instance/
 
 third_party/FastGS/
 third_party/spark/

@@ -12,6 +12,8 @@ from omegaconf import DictConfig, OmegaConf
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CFG_PATH = REPO_ROOT / "config" / "default.yaml"
+# Local-only overrides (gitignored). Put `openai.api_key` here instead of default.yaml.
+SECRETS_LOCAL_PATH = REPO_ROOT / "config" / "secrets.local.yaml"
 
 
 def load_config(
@@ -20,12 +22,16 @@ def load_config(
 ) -> DictConfig:
     """Load YAML config and apply optional dotlist overrides.
 
+    Merge order: ``default.yaml`` < ``secrets.local.yaml`` (if present) < dotlist.
+
     Example overrides: ['cuboid.size_xyz=[6,6,3]', 'mock.enabled=true'].
     """
     path = Path(config_path) if config_path else DEFAULT_CFG_PATH
     if not path.exists():
         raise FileNotFoundError(f"Config not found: {path}")
     cfg = OmegaConf.load(str(path))
+    if SECRETS_LOCAL_PATH.exists():
+        cfg = OmegaConf.merge(cfg, OmegaConf.load(str(SECRETS_LOCAL_PATH)))
     if overrides:
         cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(list(overrides)))
     return cfg  # type: ignore[return-value]

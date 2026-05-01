@@ -1,18 +1,30 @@
-"""OpenAI gpt-image-2 wrapper used by the ERP pipeline.
+﻿"""ImageClient — minimal wrapper around an OpenAI-compatible image API.
 
-We expose a small surface area:
-  - generate_rgb(prompt, size)            -> PIL.Image (RGB)
-  - edit_with_mask(prompt, image, mask)   -> PIL.Image (RGB)
-  - ImageClient.generate_aligned_triplet  -> (rgb, depth_img, normal_img)
+Two API paths, selected by ``OpenAIConfig.provider``:
 
-The wrapper is fully cache-aware: every request's key is sha256 of
-(model, size, quality, prompt, ref_bytes, mask_bytes), so reruns of the
-pipeline on the same prompt+pose are free.
+  * ``provider="openai"`` (the **standard** path) — uses
+    ``client.images.generate`` / ``client.images.edit`` from the official
+    OpenAI Python SDK. The same code works against:
+      - OpenAI direct (`base_url=""` or `https://api.openai.com/v1`)
+      - any OpenAI-compatible relay (super.shangliu.org / OneAPI / LiteLLM /
+        ...) — just point ``base_url`` at it.
+    gpt-image-2 native sizes are accepted by the server (e.g. 2048×1024 for
+    a real 2:1 ERP, multiples of 16 up to ~3840 long-edge, ratio ≤ 3:1).
 
-If `mock=True` (or `OPENAI_API_KEY` is unset and `allow_mock=True`), the
-wrapper falls back to a local procedural renderer that produces synthetic but
-self-consistent ERP triplets, so downstream stages can be exercised without
-spending API credits.
+  * ``provider="openrouter"`` (the **chat** path) — fallback for OpenRouter,
+    which does NOT expose ``/v1/images/*`` for image-output models. We use
+    ``client.chat.completions.create`` with ``modalities=["image","text"]``
+    and read the result from ``message.images[0].image_url.url``. Output is
+    locked to 1024×1024 by the server; no size parameter overrides this.
+
+The class exposes exactly two public generation methods:
+
+  * ``generate_rgb(prompt, size)`` — text-to-image
+  * ``generate_with_ref(prompt, ref_image, size)`` — image-to-image (no mask)
+
+plus tiny helpers (``parse_size``, ``supports_native_2x1_ratio``).
+
+All API calls are cached on disk by SHA256 of the request fingerprint.
 """
 
 from __future__ import annotations
@@ -26,10 +38,28 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
-import numpy as np
+import requests
 from PIL import Image
 
-from .warp import erp_camera_dirs
+
+def _decode_image_resp(resp) -> Image.Image:
+    """Convert an images.generate / images.edit response to a PIL.Image,
+    accepting either ``b64_json`` (OpenAI direct) or ``url`` (chatfire and
+    other relays sometimes return a hosted URL instead)."""
+    d = resp.data[0]
+    b64 = getattr(d, "b64_json", None)
+    url = getattr(d, "url", None)
+    if b64:
+        raw = base64.b64decode(b64)
+    elif url:
+        r = requests.get(url, timeout=120)
+        r.raise_for_status()
+        raw = r.content
+    else:
+        raise RuntimeError(
+            f"image API returned neither b64_json nor url: {d!r}"
+        )
+    return Image.open(io.BytesIO(raw)).convert("RGB")
 
 
 # ---------------------------------------------------------------------------
@@ -39,39 +69,48 @@ from .warp import erp_camera_dirs
 
 @dataclass
 class OpenAIConfig:
+    # "openai"     -> /v1/images/{generations,edits} (any OpenAI-compatible
+    #                 endpoint: openai.com / shangliu / OneAPI / LiteLLM ...)
+    # "openrouter" -> /v1/chat/completions with modalities=["image","text"]
+    provider: str = "openai"
     model: str = "gpt-image-2"
-    size: str = "3840x1920"
-    rgb_quality: str = "high"
-    edit_quality: str = "high"
+    size: str = "2048x1024"
     api_key_env: str = "OPENAI_API_KEY"
-    request_timeout_sec: float = 180.0
+    api_key: str = ""  # do not commit a real key; prefer the env var
+    base_url: str = ""  # empty = official OpenAI api.openai.com
+    rgb_quality: str = "high"
+    request_timeout_sec: float = 600.0
     max_retries: int = 4
     retry_backoff_sec: float = 5.0
     cache_dir: str = "outputs/.openai_cache"
     text_model: str = "gpt-5.5-pro"
     text_model_api_key_env: str = "OPENAI_API_KEY"
     reasoning_effort: str = "high"
-    image_reasoning_effort: str | None = None
+    # OpenRouter ranking headers (harmless to leave on for other providers).
+    http_referer: str = "https://github.com/Strange-animalss/EGMOR"
+    app_title: str = "EGMOR"
 
     @classmethod
     def from_dict(cls, cfg) -> "OpenAIConfig":
         from omegaconf import OmegaConf
         d = OmegaConf.to_container(cfg, resolve=True) if hasattr(cfg, "_content") else dict(cfg)
-        image_re = d.get("image_reasoning_effort", None)
         return cls(
+            provider=str(d.get("provider", "openai")).lower(),
             model=str(d.get("model", "gpt-image-2")),
-            size=str(d.get("size", "3840x1920")),
-            rgb_quality=str(d.get("rgb_quality", "high")),
-            edit_quality=str(d.get("edit_quality", "high")),
+            size=str(d.get("size", "2048x1024")),
             api_key_env=str(d.get("api_key_env", "OPENAI_API_KEY")),
-            request_timeout_sec=float(d.get("request_timeout_sec", 180.0)),
+            api_key=str(d.get("api_key", "")),
+            base_url=str(d.get("base_url", "")),
+            rgb_quality=str(d.get("rgb_quality", "high")),
+            request_timeout_sec=float(d.get("request_timeout_sec", 600.0)),
             max_retries=int(d.get("max_retries", 4)),
             retry_backoff_sec=float(d.get("retry_backoff_sec", 5.0)),
             cache_dir=str(d.get("cache_dir", "outputs/.openai_cache")),
             text_model=str(d.get("text_model", "gpt-5.5-pro")),
             text_model_api_key_env=str(d.get("text_model_api_key_env", "OPENAI_API_KEY")),
             reasoning_effort=str(d.get("reasoning_effort", "high")),
-            image_reasoning_effort=str(image_re) if image_re is not None else None,
+            http_referer=str(d.get("http_referer", "https://github.com/Strange-animalss/EGMOR")),
+            app_title=str(d.get("app_title", "EGMOR")),
         )
 
 
@@ -82,17 +121,14 @@ class OpenAIConfig:
 
 def _png_bytes(img: Image.Image) -> bytes:
     buf = io.BytesIO()
-    img.convert("RGBA" if img.mode == "RGBA" else "RGB").save(buf, format="PNG")
+    img.convert("RGB").save(buf, format="PNG")
     return buf.getvalue()
 
 
 def _hash_request(parts: Iterable[bytes | str]) -> str:
     h = hashlib.sha256()
     for p in parts:
-        if isinstance(p, str):
-            h.update(p.encode("utf-8"))
-        else:
-            h.update(p)
+        h.update(p.encode("utf-8") if isinstance(p, str) else p)
         h.update(b"\x1f")
     return h.hexdigest()
 
@@ -103,51 +139,32 @@ def _hash_request(parts: Iterable[bytes | str]) -> str:
 
 
 class ImageClient:
-    """Thin wrapper around openai.images.* with caching and retries."""
+    """Tiny wrapper around the OpenAI image endpoints with caching + retries."""
 
-    def __init__(
-        self,
-        cfg: OpenAIConfig,
-        *,
-        mock: bool = False,
-        allow_mock_fallback: bool = True,
-        verbose: bool = True,
-    ) -> None:
+    def __init__(self, cfg: OpenAIConfig, *, verbose: bool = True) -> None:
         self.cfg = cfg
         self.verbose = verbose
         self._cache_dir = Path(cfg.cache_dir)
         self._cache_dir.mkdir(parents=True, exist_ok=True)
-        self._mock = bool(mock)
 
-        self._client = None
-        if not self._mock:
-            api_key = os.environ.get(cfg.api_key_env, "").strip()
-            if not api_key:
-                if allow_mock_fallback:
-                    self._mock = True
-                    if verbose:
-                        print(
-                            f"[openai_erp] {cfg.api_key_env} not set; "
-                            f"falling back to mock mode."
-                        )
-                else:
-                    raise RuntimeError(
-                        f"{cfg.api_key_env} env var is required but not set"
-                    )
-            else:
-                try:
-                    from openai import OpenAI  # noqa: WPS433
+        api_key = cfg.api_key.strip() or os.environ.get(cfg.api_key_env, "").strip()
+        if not api_key:
+            raise RuntimeError(
+                f"{cfg.api_key_env} env var is required (or set openai.api_key in the config)"
+            )
 
-                    self._client = OpenAI(api_key=api_key, timeout=cfg.request_timeout_sec)
-                except Exception as exc:  # pragma: no cover - import error path
-                    if allow_mock_fallback:
-                        self._mock = True
-                        if verbose:
-                            print(f"[openai_erp] OpenAI SDK not usable ({exc}); mock mode.")
-                    else:
-                        raise
+        from openai import OpenAI  # noqa: WPS433
+        kwargs: dict = dict(api_key=api_key, timeout=cfg.request_timeout_sec)
+        if cfg.base_url:
+            kwargs["base_url"] = cfg.base_url
+        if cfg.provider == "openrouter":
+            kwargs["default_headers"] = {
+                "HTTP-Referer": cfg.http_referer,
+                "X-Title": cfg.app_title,
+            }
+        self._client = OpenAI(**kwargs)
 
-    # ------------------------------ caching -------------------------------
+    # ----- caching ------------------------------------------------------
 
     def _load_cached(self, key: str) -> Optional[Image.Image]:
         path = self._cache_dir / f"{key}.png"
@@ -159,39 +176,65 @@ class ImageClient:
         return None
 
     def _save_cached(self, key: str, img: Image.Image) -> None:
-        path = self._cache_dir / f"{key}.png"
-        img.save(path, format="PNG")
+        img.save(self._cache_dir / f"{key}.png", format="PNG")
 
-    # ------------------------------ helpers -------------------------------
+    # ----- public helpers ----------------------------------------------
 
     @property
-    def mock_mode(self) -> bool:
-        return self._mock
+    def supports_native_2x1_ratio(self) -> bool:
+        """OpenRouter chat-image is locked to 1024×1024; the standard path
+        accepts whatever the server supports (e.g. 2048×1024 on a relay
+        that routes to real gpt-image-2)."""
+        return self.cfg.provider != "openrouter"
 
     def parse_size(self, size_str: str | None = None) -> tuple[int, int]:
         s = size_str or self.cfg.size
         w, h = s.lower().split("x")
         return int(w), int(h)
 
-    # ------------------------------ generate ------------------------------
+    # ----- generate -----------------------------------------------------
 
     def generate_rgb(self, prompt: str, *, size: str | None = None) -> Image.Image:
         size = size or self.cfg.size
         key = _hash_request([
-            "generate", self.cfg.model, size, self.cfg.rgb_quality, prompt,
-            self.cfg.image_reasoning_effort or "",
+            "generate", self.cfg.provider, self.cfg.model, size,
+            (self.cfg.rgb_quality or ""), prompt,
         ])
         cached = self._load_cached(key)
         if cached is not None:
             return cached
-
-        if self._mock:
-            img = _mock_rgb_erp(self.parse_size(size), prompt)
-            self._save_cached(key, img)
-            return img
-
         img = self._call_with_retry(
-            self._call_generate, prompt=prompt, size=size, quality=self.cfg.rgb_quality
+            self._call_generate, prompt=prompt, size=size,
+        )
+        self._save_cached(key, img)
+        return img
+
+    def generate_with_ref(
+        self,
+        prompt: str,
+        ref_image: Image.Image,
+        *,
+        size: str | None = None,
+    ) -> Image.Image:
+        """Image-to-image, no mask: the model takes the whole reference and
+        produces a new image conditioned on it.
+
+        - standard path (provider="openai"): client.images.edit(image=ref, ...)
+        - chat path     (provider="openrouter"): chat.completions with the
+          ref encoded as a base64 image_url content part.
+        """
+        size = size or self.cfg.size
+        ref_bytes = _png_bytes(ref_image)
+        key = _hash_request([
+            "i2i", self.cfg.provider, self.cfg.model, size,
+            (self.cfg.rgb_quality or ""), prompt, ref_bytes,
+        ])
+        cached = self._load_cached(key)
+        if cached is not None:
+            return cached
+        img = self._call_with_retry(
+            self._call_generate_with_ref,
+            prompt=prompt, ref_bytes=ref_bytes, size=size,
         )
         self._save_cached(key, img)
         return img
@@ -203,82 +246,181 @@ class ImageClient:
         mask: Image.Image,
         *,
         size: str | None = None,
-        quality: str | None = None,
     ) -> Image.Image:
+        """Mask-aware inpaint: ``client.images.edit`` is told to fill the
+        transparent ``alpha=0`` regions of ``mask`` while preserving the rest
+        of ``image``. Used by the warp+inpaint NVS path so the model only
+        invents the disocclusions revealed by the corner camera move.
+
+        Standard provider only -- OpenRouter does not expose ``images.edits``,
+        and the chat path cannot enforce a per-pixel keep mask anyway.
+        """
+        if self.cfg.provider != "openai":
+            raise RuntimeError(
+                "edit_with_mask requires provider='openai' (images.edits "
+                "is not available on OpenRouter chat path)"
+            )
         size = size or self.cfg.size
-        quality = quality or self.cfg.edit_quality
         ref_bytes = _png_bytes(image)
-        mask_bytes = _png_bytes(mask)
+        # mask must keep its alpha channel — convert to RGBA bytes.
+        buf = io.BytesIO()
+        mask.convert("RGBA").save(buf, format="PNG")
+        mask_bytes = buf.getvalue()
         key = _hash_request([
-            "edits", self.cfg.model, size, quality, prompt, ref_bytes, mask_bytes,
-            self.cfg.image_reasoning_effort or "",
+            "edit_mask", self.cfg.provider, self.cfg.model, size,
+            (self.cfg.rgb_quality or ""), prompt, ref_bytes, mask_bytes,
         ])
         cached = self._load_cached(key)
         if cached is not None:
             return cached
-
-        if self._mock:
-            img = _mock_edit_erp(self.parse_size(size), image, mask, prompt)
-            self._save_cached(key, img)
-            return img
-
         img = self._call_with_retry(
-            self._call_edit,
-            prompt=prompt,
-            image_bytes=ref_bytes,
-            mask_bytes=mask_bytes,
-            size=size,
-            quality=quality,
+            self._call_edit_with_mask,
+            prompt=prompt, ref_bytes=ref_bytes, mask_bytes=mask_bytes, size=size,
         )
         self._save_cached(key, img)
         return img
 
-    # ------------------------- inner: real API ---------------------------
+    # ----- decoder experiment helpers ----------------------------------
 
-    def _call_generate(self, *, prompt: str, size: str, quality: str) -> Image.Image:
-        kwargs: dict = dict(
-            model=self.cfg.model,
-            prompt=prompt,
-            size=size,
-            quality=quality,
-            n=1,
+    def decode_to_depth(self, rgb: Image.Image, *, size: str | None = None) -> Image.Image:
+        """Ask gpt-image-2 to convert an RGB ERP into a grayscale depth map.
+
+        Used purely as an experimental sanity check against DAP-V2 — the main
+        pipeline still uses DAP for downstream geometry.
+        """
+        prompt = (
+            "Convert this exact 360-degree equirectangular panorama into a "
+            "grayscale depth map. White/bright = nearest surface; "
+            "black/dark = farthest surface. Pixel-perfect alignment with the "
+            "input image: same layout, same geometry, same pixel positions. "
+            "No text, no shading from light, no surface textures or colours, "
+            "ONLY a per-pixel monochrome depth representation."
         )
-        if self.cfg.image_reasoning_effort:
-            kwargs["reasoning_effort"] = self.cfg.image_reasoning_effort
-        resp = self._client.images.generate(**kwargs)  # type: ignore[union-attr]
-        b64 = resp.data[0].b64_json
-        if not b64:
-            raise RuntimeError("OpenAI generate returned empty b64_json")
-        return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+        return self.generate_with_ref(prompt, rgb, size=size)
 
-    def _call_edit(
-        self,
-        *,
-        prompt: str,
-        image_bytes: bytes,
-        mask_bytes: bytes,
-        size: str,
-        quality: str,
+    def decode_to_normal(self, rgb: Image.Image, *, size: str | None = None) -> Image.Image:
+        """Ask gpt-image-2 to convert an RGB ERP into a surface normal map."""
+        prompt = (
+            "Convert this exact 360-degree equirectangular panorama into a "
+            "world-space surface normal map. Each pixel encodes the surface "
+            "normal as RGB: R = normal X (right), G = normal Y (up), "
+            "B = normal Z (toward camera). Use flat per-surface colours, "
+            "no shading, no lighting, no textures. Pixel-perfect alignment "
+            "with the input image: same layout, same geometry."
+        )
+        return self.generate_with_ref(prompt, rgb, size=size)
+
+    # ----- inner: API calls --------------------------------------------
+
+    def _gen_kwargs(self, *, prompt: str, size: str) -> dict:
+        kw: dict = dict(model=self.cfg.model, prompt=prompt, size=size, n=1)
+        # gpt-image-2 accepts quality=low|medium|high|auto. Some older relays
+        # / SDK versions reject the kwarg; we guard against that in the call.
+        q = (self.cfg.rgb_quality or "").strip().lower()
+        if q:
+            kw["quality"] = q
+        return kw
+
+    def _call_generate(self, *, prompt: str, size: str) -> Image.Image:
+        if self.cfg.provider == "openrouter":
+            return self._chat_image_call(prompt=prompt, ref_image_bytes=None)
+        # standard OpenAI / OpenAI-compatible relay
+        kw = self._gen_kwargs(prompt=prompt, size=size)
+        try:
+            resp = self._client.images.generate(**kw)  # type: ignore[union-attr]
+        except TypeError as te:
+            if "quality" in str(te) and "quality" in kw:
+                kw.pop("quality", None)
+                resp = self._client.images.generate(**kw)  # type: ignore[union-attr]
+            else:
+                raise
+        return _decode_image_resp(resp)
+
+    def _call_edit_with_mask(
+        self, *, prompt: str, ref_bytes: bytes, mask_bytes: bytes, size: str,
     ) -> Image.Image:
-        img_io = io.BytesIO(image_bytes)
+        """Mask-aware ``images.edit`` call (provider='openai' only)."""
+        img_io = io.BytesIO(ref_bytes)
         img_io.name = "image.png"
         mask_io = io.BytesIO(mask_bytes)
         mask_io.name = "mask.png"
-        kwargs = dict(
-            model=self.cfg.model,
-            prompt=prompt,
-            image=img_io,
-            mask=mask_io,
-            size=size,
-            quality=quality,
-            n=1,
+        kw: dict = dict(
+            model=self.cfg.model, prompt=prompt,
+            image=img_io, mask=mask_io, size=size, n=1,
         )
-        if self.cfg.image_reasoning_effort:
-            kwargs["reasoning_effort"] = self.cfg.image_reasoning_effort
-        resp = self._client.images.edits(**kwargs)  # type: ignore[union-attr]
-        b64 = resp.data[0].b64_json
-        if not b64:
-            raise RuntimeError("OpenAI edit returned empty b64_json")
+        q = (self.cfg.rgb_quality or "").strip().lower()
+        if q:
+            kw["quality"] = q
+        try:
+            resp = self._client.images.edit(**kw)  # type: ignore[union-attr]
+        except TypeError as te:
+            if "quality" in str(te) and "quality" in kw:
+                kw.pop("quality", None)
+                img_io.seek(0)
+                mask_io.seek(0)
+                resp = self._client.images.edit(**kw)  # type: ignore[union-attr]
+            else:
+                raise
+        return _decode_image_resp(resp)
+
+    def _call_generate_with_ref(
+        self, *, prompt: str, ref_bytes: bytes, size: str,
+    ) -> Image.Image:
+        if self.cfg.provider == "openrouter":
+            return self._chat_image_call(prompt=prompt, ref_image_bytes=ref_bytes)
+        # standard images.edit (no mask = whole-image i2i)
+        img_io = io.BytesIO(ref_bytes)
+        img_io.name = "image.png"
+        kw: dict = dict(
+            model=self.cfg.model, prompt=prompt, image=img_io, size=size, n=1,
+        )
+        # images.edit also supports quality on gpt-image-2; same TypeError guard.
+        q = (self.cfg.rgb_quality or "").strip().lower()
+        if q:
+            kw["quality"] = q
+        try:
+            resp = self._client.images.edit(**kw)  # type: ignore[union-attr]
+        except TypeError as te:
+            if "quality" in str(te) and "quality" in kw:
+                kw.pop("quality", None)
+                # bytes-based image objects can be re-used; reset stream pos
+                img_io.seek(0)
+                resp = self._client.images.edit(**kw)  # type: ignore[union-attr]
+            else:
+                raise
+        return _decode_image_resp(resp)
+
+    def _chat_image_call(
+        self, *, prompt: str, ref_image_bytes: bytes | None,
+    ) -> Image.Image:
+        """OpenRouter chat-completions image path. Output is always 1024×1024
+        on the server side (no size override is honoured), so we just return
+        whatever PIL decoded — the caller must accept 1024×1024 ERP."""
+        content: list = [{"type": "text", "text": prompt}]
+        if ref_image_bytes is not None:
+            ref_b64 = base64.b64encode(ref_image_bytes).decode("ascii")
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{ref_b64}"},
+            })
+        resp = self._client.chat.completions.create(  # type: ignore[union-attr]
+            model=self.cfg.model,
+            messages=[{"role": "user", "content": content}],
+            extra_body={"modalities": ["image", "text"]},
+        )
+        msg = resp.choices[0].message
+        images = getattr(msg, "images", None)
+        if images is None and hasattr(msg, "model_extra"):
+            images = (msg.model_extra or {}).get("images")
+        if not images:
+            raise RuntimeError(
+                f"OpenRouter chat returned no images. content={getattr(msg, 'content', None)!r}"
+            )
+        first = images[0]
+        url = first["image_url"]["url"] if isinstance(first, dict) else first.image_url.url
+        if not url.startswith("data:"):
+            raise RuntimeError(f"Unexpected image url (not data:): {url[:80]}")
+        b64 = url.split(",", 1)[1]
         return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
 
     def _call_with_retry(self, fn, **kwargs) -> Image.Image:
@@ -291,160 +433,10 @@ class ImageClient:
                 if self.verbose:
                     print(
                         f"[openai_erp] {fn.__name__} attempt {attempt + 1}/"
-                        f"{self.cfg.max_retries + 1} failed: {exc}"
+                        f"{self.cfg.max_retries + 1} failed: {exc}",
+                        flush=True,
                     )
                 if attempt == self.cfg.max_retries:
                     break
-                time.sleep(self.cfg.retry_backoff_sec * (2**attempt))
+                time.sleep(self.cfg.retry_backoff_sec * (2 ** attempt))
         raise RuntimeError(f"OpenAI API failed after retries: {last_exc}")
-
-    # ------------------------- aligned triplet ---------------------------
-
-    def generate_aligned_triplet(
-        self,
-        prompts: dict[str, str],
-        *,
-        ref_rgb: Image.Image | None = None,
-        ref_mask: Image.Image | None = None,
-        size: str | None = None,
-    ) -> dict[str, Image.Image]:
-        """Generate 3 ERPs (rgb / depth / normal).
-
-        If `ref_rgb` is None: 3 independent generate() calls (used for the
-        center pose). Otherwise we route everything through edits() with
-        ref_rgb + ref_mask so the depth/normal share the warped layout.
-        """
-        out: dict[str, Image.Image] = {}
-        if ref_rgb is None:
-            for k in ("rgb", "depth", "normal"):
-                out[k] = self.generate_rgb(prompts[k], size=size)
-        else:
-            if ref_mask is None:
-                raise ValueError("ref_mask is required when ref_rgb is provided")
-            out["rgb"] = self.edit_with_mask(
-                prompts["rgb"], ref_rgb, ref_mask, size=size
-            )
-            out["depth"] = self.edit_with_mask(
-                prompts["depth"], out["rgb"], ref_mask, size=size
-            )
-            out["normal"] = self.edit_with_mask(
-                prompts["normal"], out["rgb"], ref_mask, size=size
-            )
-        return out
-
-
-# ---------------------------------------------------------------------------
-# Mock renderer
-# ---------------------------------------------------------------------------
-#
-# These produce synthetic but pose-consistent ERP triplets so the pipeline
-# (decode -> cubemap -> COLMAP -> FastGS -> viewer) can be smoke-tested
-# without an OpenAI key. The mock encodes:
-#   * RGB: a colorful checker-room with hue keyed by prompt hash
-#   * Depth: distance to the unit-cube room walls (white near, black far),
-#           range mapped into the configured near/far so decode roundtrips
-#   * Normal: world-space normal of the dominant cube wall in each pixel
-# Mock does NOT account for the camera pose -- that's fine because the mock
-# is only for plumbing tests.
-
-
-def _prompt_hue(prompt: str) -> float:
-    h = hashlib.sha256(prompt.encode("utf-8")).digest()
-    return (h[0] / 255.0) % 1.0
-
-
-def _ray_box_distance(dirs: np.ndarray, half: tuple[float, float, float]) -> np.ndarray:
-    """Distance from origin to an axis-aligned cube of half-extents `half`,
-    along each ray direction."""
-    eps = 1e-6
-    safe = np.where(np.abs(dirs) < eps, eps, dirs)
-    hx, hy, hz = half
-    t1 = hx / np.abs(safe[..., 0])
-    t2 = hy / np.abs(safe[..., 1])
-    t3 = hz / np.abs(safe[..., 2])
-    return np.minimum(np.minimum(t1, t2), t3)
-
-
-def _mock_rgb_erp(size_wh: tuple[int, int], prompt: str) -> Image.Image:
-    width, height = size_wh
-    dirs = erp_camera_dirs(width, height)
-    box_half = (1.6, 1.6, 1.2)
-    t = _ray_box_distance(dirs, box_half)
-    hits = dirs * t[..., None]
-    base_hue = _prompt_hue(prompt)
-    # checker pattern in 2D on the dominant axis face
-    abs_hits = np.abs(hits)
-    axis = np.argmax(abs_hits, axis=-1)
-    coords = np.where(axis[..., None] == 0, hits[..., 1:3],
-                      np.where(axis[..., None] == 1, hits[..., 0:3:2], hits[..., 0:2]))
-    cell = np.floor(coords * 4.0).astype(np.int32)
-    chk = ((cell[..., 0] + cell[..., 1]) & 1).astype(np.float32)
-    # hue varies per face
-    hue_offset = (axis.astype(np.float32) * 0.17 + base_hue) % 1.0
-    sat = 0.55 + 0.25 * chk
-    val = 0.6 + 0.3 * chk
-    hsv = np.stack([hue_offset, sat, val], axis=-1)
-    rgb = _hsv_to_rgb(hsv)
-    rgb = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
-    return Image.fromarray(rgb, "RGB")
-
-
-def _mock_edit_erp(
-    size_wh: tuple[int, int],
-    image: Image.Image,
-    mask: Image.Image,
-    prompt: str,
-) -> Image.Image:
-    width, height = size_wh
-    if "GRAYSCALE DEPTH MAP" in prompt:
-        return _mock_depth_erp(size_wh)
-    if "SURFACE NORMAL MAP" in prompt:
-        return _mock_normal_erp(size_wh)
-    base = image.convert("RGB").resize((width, height), Image.BICUBIC)
-    fill = _mock_rgb_erp(size_wh, prompt + "_edit")
-    m = mask.convert("L").resize((width, height), Image.NEAREST)
-    arr_base = np.array(base, dtype=np.uint8)
-    arr_fill = np.array(fill, dtype=np.uint8)
-    m_arr = (np.array(m, dtype=np.float32) / 255.0)[..., None]
-    out = arr_base * (1.0 - m_arr) + arr_fill * m_arr
-    return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), "RGB")
-
-
-def _mock_depth_erp(size_wh: tuple[int, int]) -> Image.Image:
-    width, height = size_wh
-    dirs = erp_camera_dirs(width, height)
-    t = _ray_box_distance(dirs, (1.6, 1.6, 1.2))
-    near, far = 0.3, 12.0
-    norm = (far - t) / (far - near)
-    norm = np.clip(norm, 0.0, 1.0)
-    g = np.clip(norm * 255.0, 0, 255).astype(np.uint8)
-    rgb = np.stack([g, g, g], axis=-1)
-    return Image.fromarray(rgb, "RGB")
-
-
-def _mock_normal_erp(size_wh: tuple[int, int]) -> Image.Image:
-    width, height = size_wh
-    dirs = erp_camera_dirs(width, height)
-    abs_hits = np.abs(dirs)
-    axis = np.argmax(abs_hits, axis=-1)
-    sign = np.sign(np.take_along_axis(dirs, axis[..., None], axis=-1))[..., 0]
-    nrm = np.zeros_like(dirs)
-    idx = np.indices(axis.shape)
-    nrm[idx[0], idx[1], axis] = -sign
-    rgb = np.clip((nrm * 0.5 + 0.5) * 255.0, 0, 255).astype(np.uint8)
-    return Image.fromarray(rgb, "RGB")
-
-
-def _hsv_to_rgb(hsv: np.ndarray) -> np.ndarray:
-    h = (hsv[..., 0] % 1.0) * 6.0
-    s = hsv[..., 1]
-    v = hsv[..., 2]
-    i = np.floor(h).astype(np.int32) % 6
-    f = h - np.floor(h)
-    p = v * (1.0 - s)
-    q = v * (1.0 - s * f)
-    t = v * (1.0 - s * (1.0 - f))
-    r = np.choose(i, [v, q, p, p, t, v])
-    g = np.choose(i, [t, v, v, q, p, p])
-    b = np.choose(i, [p, p, t, v, v, q])
-    return np.stack([r, g, b], axis=-1)

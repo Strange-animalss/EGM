@@ -1,0 +1,5 @@
+{
+  "ok": false,
+  "error": "OPENAI_API_KEY is not set",
+  "run": "python scripts/docs_sample_gpt_image2_official.py"
+}
